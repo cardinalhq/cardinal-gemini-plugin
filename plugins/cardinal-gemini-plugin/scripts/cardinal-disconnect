@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Disconnect Gemini CLI from Cardinal."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+GEMINI_DIR = Path.home() / ".gemini"
+SETTINGS_PATH = GEMINI_DIR / "settings.json"
+EXTENSION_DIR = GEMINI_DIR / "extensions" / "cardinal"
+STATE_PATH = GEMINI_DIR / "cardinal.json"
+SECRETS_PATH = GEMINI_DIR / "cardinal-secrets.json"
+# Plugin-owned runtime state: telemetry progress cursors, the plan stamp,
+# and spend-limits verdict/ack/override files.
+RUNTIME_DIR = GEMINI_DIR / "cardinal"
+
+
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_suffix(f"{path.suffix}.bak.{ts}")
+    target.write_text(path.read_text())
+    return target
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        sys.exit(f"Refusing to proceed: {path} is unreadable ({exc})")
+    if not isinstance(data, dict):
+        sys.exit(f"Refusing to proceed: {path} is not a JSON object.")
+    return data
+
+
+def read_mcp_plaintext() -> str | None:
+    """Best-effort plaintext MCP key lookup — from settings.json first,
+    then the extension manifest."""
+    settings = load_json(SETTINGS_PATH)
+    servers = settings.get("mcpServers") if isinstance(settings.get("mcpServers"), dict) else {}
+    entry = servers.get("cardinal") if isinstance(servers, dict) else None
+    if isinstance(entry, dict):
+        headers = entry.get("headers") or entry.get("http_headers")
+        if isinstance(headers, dict):
+            v = headers.get("X-CardinalHQ-API-Key")
+            if isinstance(v, str) and v:
+                return v
+
+    manifest_path = EXTENSION_DIR / "gemini-extension.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            return None
+        servers = manifest.get("mcpServers") if isinstance(manifest.get("mcpServers"), dict) else {}
+        entry = servers.get("cardinal") if isinstance(servers, dict) else None
+        if isinstance(entry, dict):
+            headers = entry.get("headers") or entry.get("http_headers")
+            if isinstance(headers, dict):
+                v = headers.get("X-CardinalHQ-API-Key")
+                if isinstance(v, str) and v:
+                    return v
+    return None
+
+
+def read_secrets() -> dict:
+    return load_json(SECRETS_PATH) if SECRETS_PATH.exists() else {}
+
+
+def strip_managed_settings(settings: dict) -> tuple[dict, bool]:
+    """Remove Cardinal-managed keys from settings.json. Anything the user
+    tagged themselves (no `cardinalManaged: true`) stays put."""
+    changed = False
+
+    tel = settings.get("telemetry")
+    if isinstance(tel, dict) and tel.get("cardinalManaged"):
+        settings.pop("telemetry", None)
+        changed = True
+
+    servers = settings.get("mcpServers")
+    if isinstance(servers, dict):
+        entry = servers.get("cardinal")
+        if isinstance(entry, dict) and entry.get("cardinalManaged"):
+            servers.pop("cardinal", None)
+            changed = True
+        if not servers:
+            settings.pop("mcpServers", None)
+        else:
+            settings["mcpServers"] = servers
+
+    hooks_root = settings.get("hooks")
+    if isinstance(hooks_root, dict):
+        for event, groups in list(hooks_root.items()):
+            if not isinstance(groups, list):
+                continue
+            kept = [
+                g for g in groups
+                if not (isinstance(g, dict) and g.get("cardinalManaged"))
+            ]
+            # Second pass: look inside each group's hook-command strings for
+            # our plugin marker, matching the Codex disconnect approach so
+            # entries created via older schemas still get stripped.
+            kept2 = []
+            for g in kept:
+                if not isinstance(g, dict):
+                    kept2.append(g)
+                    continue
+                handlers = g.get("hooks")
+                if not isinstance(handlers, list):
+                    kept2.append(g)
+                    continue
+                kept_handlers = [
+                    h for h in handlers
+                    if not (
+                        isinstance(h, dict)
+                        and "cardinal-gemini-plugin" in str(h.get("command") or "")
+                    )
+                ]
+                if kept_handlers:
+                    new_g = dict(g)
+                    new_g["hooks"] = kept_handlers
+                    kept2.append(new_g)
+            if len(kept2) != len(groups):
+                changed = True
+            if kept2:
+                hooks_root[event] = kept2
+            else:
+                hooks_root.pop(event, None)
+        settings["hooks"] = hooks_root
+        if not hooks_root:
+            settings.pop("hooks", None)
+
+    return settings, changed
+
+
+def remove_settings_block() -> bool:
+    if not SETTINGS_PATH.exists():
+        return False
+    settings = load_json(SETTINGS_PATH)
+    new_settings, changed = strip_managed_settings(settings)
+    if changed:
+        backup_path = backup(SETTINGS_PATH)
+        atomic_write(SETTINGS_PATH, json.dumps(new_settings, indent=2) + "\n")
+        print(f"Stripped managed Cardinal keys from {SETTINGS_PATH}")
+        if backup_path:
+            print(f"Backup: {backup_path}")
+    return changed
+
+
+def remove_extension_dir() -> bool:
+    if not EXTENSION_DIR.exists():
+        return False
+    manifest = EXTENSION_DIR / "gemini-extension.json"
+    is_ours = False
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text())
+            is_ours = bool(data.get("cardinalManaged"))
+        except Exception:
+            pass
+    if not is_ours:
+        print(f"WARN {EXTENSION_DIR} exists but was not tagged cardinalManaged — leaving in place.")
+        return False
+    shutil.rmtree(EXTENSION_DIR, ignore_errors=True)
+    print(f"Removed Cardinal extension bundle at {EXTENSION_DIR}")
+    return True
+
+
+def revoke_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
+    url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
+    headers = {"content-type": "application/json"}
+    if plaintext:
+        headers["X-CardinalHQ-API-Key"] = plaintext
+    req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 204), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return False, f"network error: {exc}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-disconnect",
+        description="Disconnect Gemini CLI from Cardinal.",
+    )
+    parser.add_argument("--force", action="store_true",
+                        help="Do not fail if ~/.gemini/cardinal.json is missing.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if not STATE_PATH.exists() and not args.force:
+        print("Cardinal is not connected. Nothing to do.")
+        return 0
+
+    state = load_json(STATE_PATH)
+    host = state.get("host") or "https://app.cardinalhq.io"
+    secrets = read_secrets()
+    mcp_key_id = state.get("mcp_key_id")
+    ingest_key_id = state.get("ingest_key_id")
+
+    if ingest_key_id:
+        plaintext = secrets.get("ingest_api_key")
+        ok, msg = revoke_key(host, ingest_key_id, plaintext if isinstance(plaintext, str) else None)
+        if ok:
+            print(f"Revoked ingest key {state.get('ingest_key_prefix') or ingest_key_id} server-side ({msg})")
+        else:
+            print(f"Could not revoke ingest key server-side ({msg}).")
+            print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
+    if mcp_key_id:
+        plaintext = read_mcp_plaintext() or secrets.get("mcp_api_key")
+        ok, msg = revoke_key(host, mcp_key_id, plaintext if isinstance(plaintext, str) else None)
+        if ok:
+            print(f"Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
+        else:
+            print(f"Could not revoke MCP key server-side ({msg}).")
+            print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
+    settings_changed = remove_settings_block()
+    if not settings_changed:
+        print(f"No managed Cardinal keys found in {SETTINGS_PATH}")
+
+    ext_removed = remove_extension_dir()
+    if not ext_removed and not EXTENSION_DIR.exists():
+        print(f"No Cardinal extension found at {EXTENSION_DIR}")
+
+    if SECRETS_PATH.exists():
+        SECRETS_PATH.unlink()
+        print(f"Removed {SECRETS_PATH}")
+
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+        print(f"Removed {STATE_PATH}")
+
+    if RUNTIME_DIR.exists():
+        shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+        print(f"Removed {RUNTIME_DIR}")
+
+    print()
+    print("Restart Gemini CLI so it reloads MCP and hook configuration.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

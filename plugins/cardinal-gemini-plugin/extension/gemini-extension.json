@@ -1,0 +1,14 @@
+{
+  "name": "cardinal",
+  "version": "0.1.0",
+  "description": "Connect Gemini CLI to Cardinal telemetry and MCP.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "cardinal": {
+      "url": "${CARDINAL_MCP_URL}",
+      "headers": {
+        "X-CardinalHQ-API-Key": "${CARDINAL_MCP_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "_comment": "Extension-scoped hook registrations. The `command` string is rewritten by cardinal-connect at install time to reference the plugin's absolute path.",
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event SessionStart # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "BeforeAgent": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event BeforeAgent # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "AfterModel": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event AfterModel # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "AfterTool": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event AfterTool # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "AfterAgent": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event AfterAgent # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "PreCompress": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event PreCompress # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 __HOOK_SCRIPT__ --event SessionEnd # cardinal-gemini-plugin",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}

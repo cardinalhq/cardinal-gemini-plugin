@@ -1,0 +1,41 @@
+{
+  "name": "cardinal-gemini-plugin",
+  "version": "0.1.0",
+  "description": "Connect Gemini CLI to Cardinal telemetry and MCP with a browser-approved device-code flow.",
+  "author": {
+    "name": "CardinalHQ",
+    "url": "https://cardinalhq.io"
+  },
+  "homepage": "https://github.com/cardinalhq/cardinal-gemini-plugin",
+  "repository": "https://github.com/cardinalhq/cardinal-gemini-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cardinal",
+    "mcp",
+    "observability",
+    "gemini",
+    "gemini-cli"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cardinal",
+    "shortDescription": "Connect Gemini CLI to Cardinal telemetry and MCP tools.",
+    "longDescription": "Cardinal connects Gemini CLI to a Cardinal workspace through a device-code flow, configures the unified Cardinal MCP endpoint, and installs local Gemini CLI hooks that emit agent-session telemetry for Cardinal Outcomes.",
+    "developerName": "CardinalHQ",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://cardinalhq.io/",
+    "privacyPolicyURL": "https://cardinalhq.io/privacy",
+    "termsOfServiceURL": "https://cardinalhq.io/terms",
+    "brandColor": "#3B82F6",
+    "defaultPrompt": [
+      "Connect Gemini CLI to Cardinal",
+      "Check my Cardinal connection",
+      "Disconnect Cardinal from Gemini CLI"
+    ]
+  }
+}
