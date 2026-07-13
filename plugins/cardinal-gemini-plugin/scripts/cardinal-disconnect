@@ -7,35 +7,23 @@ import argparse
 import json
 import shutil
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+from cardinal_core.paths import AgentPaths, atomic_write, backup  # noqa: E402
+
 
 GEMINI_DIR = Path.home() / ".gemini"
+PATHS = AgentPaths(home=GEMINI_DIR)
 SETTINGS_PATH = GEMINI_DIR / "settings.json"
 EXTENSION_DIR = GEMINI_DIR / "extensions" / "cardinal"
-STATE_PATH = GEMINI_DIR / "cardinal.json"
-SECRETS_PATH = GEMINI_DIR / "cardinal-secrets.json"
+STATE_PATH = PATHS.state_path
+SECRETS_PATH = PATHS.secrets_path
 # Plugin-owned runtime state: telemetry progress cursors, the plan stamp,
 # and spend-limits verdict/ack/override files.
-RUNTIME_DIR = GEMINI_DIR / "cardinal"
-
-
-def atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content)
-    tmp.replace(path)
-
-
-def backup(path: Path) -> Path | None:
-    if not path.exists():
-        return None
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    target = path.with_suffix(f"{path.suffix}.bak.{ts}")
-    target.write_text(path.read_text())
-    return target
+RUNTIME_DIR = PATHS.runtime_dir
 
 
 def load_json(path: Path) -> dict:

@@ -1,5 +1,10 @@
 # Cardinal Gemini CLI plugin marketplace
 
+> [!NOTE]
+> This repository is a **release mirror**. Development happens in
+> [cardinal-agent-plugins](https://github.com/cardinalhq/cardinal-agent-plugins) — send PRs there.
+
+
 This repository publishes one Gemini CLI plugin: `cardinal-gemini-plugin`.
 
 The plugin source lives at [`plugins/cardinal-gemini-plugin`](./plugins/cardinal-gemini-plugin), and the marketplace manifest at [`.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json) exposes only that plugin.
