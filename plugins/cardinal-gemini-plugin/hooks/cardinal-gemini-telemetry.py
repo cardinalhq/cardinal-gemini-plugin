@@ -450,6 +450,14 @@ def handle_after_agent(payload: dict[str, Any]) -> None:
         ),
         "agent_id": payload.get("agent_id") or payload.get("agentId"),
         "subagent_description": subagent_description_from_payload(payload),
+        # Cross-adapter contract key; best-effort — probe the payload and
+        # its usage block for the child's model.
+        "model": (
+            payload.get("model")
+            or payload.get("modelName")
+            or payload.get("model_name")
+            or (usage_block.get("model") if isinstance(usage_block, dict) else None)
+        ),
         "total_tokens": total_tokens,
         "duration_ms": payload.get("duration_ms") or payload.get("durationMs"),
         "status": payload.get("status"),
