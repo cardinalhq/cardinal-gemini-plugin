@@ -1,6 +1,6 @@
 {
   "name": "cardinal-gemini-plugin",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Connect Gemini CLI to Cardinal telemetry and MCP with a browser-approved device-code flow.",
   "author": {
     "name": "CardinalHQ",
