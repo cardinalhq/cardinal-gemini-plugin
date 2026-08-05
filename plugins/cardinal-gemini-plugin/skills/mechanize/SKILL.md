@@ -86,6 +86,32 @@ Gemini CLI has a subagent lifecycle observable via the `AfterAgent` hook (which 
 
 Either way, use CORE.md Stage 5.5's checklist and verdict format verbatim.
 
+## Stage 8 addendum — presenting `preview.html` in Gemini CLI
+
+Gemini CLI has no `Artifact`-tool equivalent to this SKILL. After the shared renderer writes `<OUT_DIR>/preview.html`, print the absolute path with an open instruction:
+
+```
+Preview rendered: <OUT_DIR>/preview.html
+Open with: open <OUT_DIR>/preview.html   (macOS)
+           xdg-open <OUT_DIR>/preview.html   (Linux)
+```
+
+Mermaid inside the HTML renders as raw source when opened as a plain file — known adapter degradation; the rest of the preview is fully legible.
+
+## Stage 9 addendum — rubric-gen and cold grading in Gemini CLI
+
+**Stage 9a (rubric-gen).** Run `python3 <repo-root>/common/mechanize/review.py rubric-gen-instructions <OUT_DIR>`. If the user's Gemini install has a subagent-spawning MCP tool configured, pass the printed prompt to it and instruct the subagent to write `<OUT_DIR>/rubric.md`. Otherwise, follow the prompt yourself, inline, and flag in `rationale.md` under `Unresolved`:
+
+> `Stage 9a ran inline (no subagent MCP tool available in this Gemini install). Rubric may lean toward the compiler's framing.`
+
+**Stage 9b (cold grading).** Run `python3 <repo-root>/common/mechanize/review.py grade-instructions <OUT_DIR>`. If a subagent MCP tool is available, pass the prompt verbatim (NO extra context) and instruct the subagent to write `<OUT_DIR>/review.md`.
+
+If no MCP subagent tool is available, **skip Stage 9b entirely** and record in `rationale.md`:
+
+> `Stage 9b skipped: no cold-subagent MCP tool available in this Gemini install. Per CORE.md an inline pass by the compiler is nearly worthless. Rubric available at rubric.md for manual review.`
+
+Do NOT run Stage 9b inline.
+
 ## Now continue with CORE.md
 
 At this point you should have:
@@ -93,7 +119,7 @@ At this point you should have:
 - A best-effort segmented mental model (objective, tool calls, attachments, conclusion) built via the general-structure inspector.
 - Any spill-to-disk pairs collapsed per Stage 1.5 (usually a no-op).
 
-Continue at **CORE.md Stage 2** and follow through Stage 7. Apply the addenda above where CORE.md references attachments and cold subagents.
+Continue at **CORE.md Stage 2** and follow through Stage 9. Apply the addenda above where CORE.md references attachments, cold subagents, preview presentation (Stage 8), and rubric-gen / cold grading (Stage 9).
 
 Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
 
