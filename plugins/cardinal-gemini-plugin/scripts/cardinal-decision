@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""cardinal-decision — record the decisions an agent makes while it works.
+
+Gemini CLI port of the Claude adapter's bin/cardinal-decision. Each
+recorded decision becomes one `cardinal.decision` OTLP event tagged with
+the engineer (user.email resource attribute), session, repo, branch,
+head sha, the branch's PR when `gh` can resolve it, anchors
+(files/symbols the decision governs) and D18 code clusters derived from
+them.
+
+Capture is off by default:
+    cardinal-decision on        turn capture on for this user
+    cardinal-decision off       turn it off
+    cardinal-decision status    show the setting (and a session's decisions)
+
+When capture is on, the BeforeAgent hook (hooks/cardinal-gemini-telemetry.py)
+appends the recording instructions + this session's ledger to each prompt
+and supplies --session. CARDINAL_DECISIONS=1/0 in the environment
+overrides on/off.
+
+Core logic lives in the vendored cardinal_core.decisions; the ingest
+connection comes from ~/.gemini/cardinal.json + cardinal-secrets.json
+(written by cardinal-connect), the same files the telemetry hook reads.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _plugin_version  # noqa: E402
+from cardinal_core import decisions, otlp  # noqa: E402
+from cardinal_core.initiative import canonical_repo, git  # noqa: E402
+from cardinal_core.paths import AgentPaths  # noqa: E402
+
+PATHS = AgentPaths(home=Path.home() / ".gemini")
+SCOPE_NAME = "cardinal-gemini-plugin"
+EMIT_TIMEOUT_SEC = 3.0
+EXIT_USAGE = 2
+EXIT_OFF = 3
+EXIT_LOCAL_WRITE = 4
+
+
+def _local_write_failed(err: OSError) -> int:
+    """Gemini CLI's optional sandbox (macOS permissive-open profile) blocks
+    writes under ~/.gemini, so the config/ledger write fails there."""
+    print(
+        f"cardinal-decision: could not write under {PATHS.runtime_dir} ({err.strerror or err}). "
+        "If Gemini CLI's sandbox is on (--sandbox / GEMINI_SANDBOX), it blocks writes to ~/.gemini: "
+        "turn the sandbox off for this session or allow writes to that directory, then retry. "
+        "The decision was not recorded.",
+        file=sys.stderr,
+    )
+    return EXIT_LOCAL_WRITE
+
+
+def _override() -> str | None:
+    return os.environ.get(decisions.ENABLE_ENV)
+
+
+def _session(args: argparse.Namespace) -> str | None:
+    # Gemini CLI exports GEMINI_SESSION_ID to hook processes; honour it if a
+    # caller's environment carries it too.
+    return args.session or os.environ.get("GEMINI_SESSION_ID")
+
+
+def _resource() -> dict[str, str]:
+    state = PATHS.read_state()
+    return otlp.resource_attrs(
+        service_name="gemini-cli",
+        agent_runtime="gemini",
+        deployment_environment=state.get("deployment_environment"),
+        user_email=state.get("user_email"),
+        org=state.get("org_slug") or state.get("org_id"),
+        plugin_version=_plugin_version.plugin_version(),
+    )
+
+
+def cmd_on(_args: argparse.Namespace) -> int:
+    try:
+        decisions.set_enabled(PATHS.runtime_dir, True)
+    except OSError as err:
+        return _local_write_failed(err)
+    print("Decision capture is on. New prompts will ask the agent to record its decisions.")
+    return 0
+
+
+def cmd_off(_args: argparse.Namespace) -> int:
+    try:
+        decisions.set_enabled(PATHS.runtime_dir, False)
+    except OSError as err:
+        return _local_write_failed(err)
+    print("Decision capture is off.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    override = _override()
+    enabled = decisions.is_enabled(PATHS.runtime_dir, override)
+    source = f" ({decisions.ENABLE_ENV}={override})" if decisions.parse_override(override) is not None else ""
+    print(f"Decision capture: {'on' if enabled else 'off'}{source}")
+    connected = otlp.connection_from_paths(PATHS) is not None
+    print(f"Cardinal telemetry: {'connected' if connected else 'not connected (run cardinal-connect)'}")
+    session_id = _session(args)
+    if session_id:
+        print(f"Decisions in session {session_id}:")
+        print(decisions.render_ledger(decisions.read_ledger(PATHS.runtime_dir, session_id), limit=50))
+    return 0
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    if not decisions.is_enabled(PATHS.runtime_dir, _override()):
+        print("Decision capture is off. Run `cardinal-decision on` to turn it on.", file=sys.stderr)
+        return EXIT_OFF
+    session_id = _session(args)
+    if not session_id:
+        print("cardinal-decision: --session is required (the prompt hook supplies it).", file=sys.stderr)
+        return EXIT_USAGE
+
+    cwd = os.getcwd()
+    repo_root = git(["rev-parse", "--show-toplevel"], cwd)
+    head_sha = branch = repo = None
+    if repo_root:
+        head_sha = git(["rev-parse", "HEAD"], cwd)
+        branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        repo = canonical_repo(git(["remote", "get-url", "origin"], cwd))
+
+    ledger = decisions.read_ledger(PATHS.runtime_dir, session_id)
+    try:
+        anchors = [decisions.parse_anchor(spec, repo_root, cwd) for spec in args.anchor]
+        decision = decisions.build_decision(
+            choice=args.choice,
+            question=args.question,
+            rationale=args.why,
+            decided_by=args.by,
+            alternatives=args.alt,
+            follows_from=args.follows,
+            refines=args.refines,
+            supersedes=args.supersedes,
+            anchors=anchors,
+            decision_id=args.id,
+            existing=ledger,
+        )
+    except decisions.DecisionError as err:
+        print(f"cardinal-decision: {err}", file=sys.stderr)
+        return EXIT_USAGE
+
+    cache = decisions.cache_dir(PATHS.runtime_dir)
+    clusters, scheme = decisions.code_clusters(decision["anchors"], repo_root, head_sha, cache)
+    pr_number, pr_url = decisions.resolve_pr(cwd, repo, branch, cache)
+    known = {entry["id"] for entry in ledger}
+    unknown = [link["to"] for link in decision["links"] if link["to"] not in known]
+    try:
+        decisions.record_in_ledger(PATHS.runtime_dir, session_id, decision)
+    except OSError as err:
+        return _local_write_failed(err)
+
+    connection = otlp.connection_from_paths(PATHS)
+    if connection is not None:
+        attrs = decisions.decision_attributes(
+            session_id=session_id,
+            decision=decision,
+            code_clusters=clusters,
+            cluster_scheme=scheme,
+            repo=repo,
+            branch=branch,
+            head_sha=head_sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+        )
+        otlp.emit_records(
+            [otlp.log_record(decisions.DECISION_EVENT, attrs, time.time_ns())],
+            connection,
+            _resource(),
+            scope_name=SCOPE_NAME,
+            scope_version=_plugin_version.plugin_version(),
+            timeout=EMIT_TIMEOUT_SEC,
+        )
+
+    tags = [f"PR #{pr_number}"] if pr_number else []
+    if clusters:
+        tags.append("clusters " + ", ".join(clusters))
+    detail = f" ({'; '.join(tags)})" if tags else ""
+    print(f"Recorded decision {decision['id']}: {decision['choice']}{detail}")
+    if unknown:
+        print(f"Note: no earlier decision in this session has id {', '.join(unknown)}; the link was kept as given.")
+    if connection is None:
+        print("Cardinal telemetry isn't connected, so this decision was only saved locally (run cardinal-connect).")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-decision",
+        description="Record the decisions an agent makes, tagged for the Cardinal Agent Outcomes dashboard.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="{record,on,off,status}")
+
+    record = sub.add_parser("record", help="record one decision")
+    record.add_argument("--session", help="session id (supplied by the prompt hook)")
+    record.add_argument("--choice", required=True, help="the option chosen, in a few words")
+    record.add_argument("--question", help="the question this decision settles")
+    record.add_argument("--why", help="one sentence on why this option won")
+    record.add_argument("--alt", action="append", default=[], metavar="OPTION",
+                        help="an option that was considered and rejected (repeatable)")
+    record.add_argument("--by", choices=decisions.DECIDED_BY, default="agent",
+                        help="who made the call (default: agent)")
+    record.add_argument("--anchor", action="append", default=[], metavar="ANCHOR",
+                        help="file, dir/, file::Symbol, or <kind>:<identifier>[@path] the decision governs (repeatable)")
+    record.add_argument("--follows", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one only makes sense because of")
+    record.add_argument("--refines", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one narrows")
+    record.add_argument("--supersedes", action="append", default=[], metavar="ID",
+                        help="an earlier decision this one replaces")
+    record.add_argument("--id", help="decision id; reuse an existing id to revise that decision")
+    record.set_defaults(func=cmd_record)
+
+    sub.add_parser("on", help="turn decision capture on").set_defaults(func=cmd_on)
+    sub.add_parser("off", help="turn decision capture off").set_defaults(func=cmd_off)
+    status = sub.add_parser("status", help="show whether capture is on")
+    status.add_argument("--session", help="also list this session's decisions")
+    status.set_defaults(func=cmd_status)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

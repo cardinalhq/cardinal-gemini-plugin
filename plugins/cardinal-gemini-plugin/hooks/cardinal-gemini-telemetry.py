@@ -10,19 +10,28 @@ telemetry must not break the agent loop.
 Monorepo adapter: all shared behavior (OTLP contract, initiative
 resolution, bash classification, pricing, spend-limits delivery, session
 counters) comes from the vendored `cardinal_core` package; this file keeps
-only the Gemini-specific parts — payload-key probing (usage/usageMetadata
-spellings), tool-name normalization, and event dispatch.
+only the Gemini-specific parts — payload parsing, tool-name normalization,
+and event dispatch.
 
-Event dispatch (see docs/specs/gemini-parity.md in the source repo for the
-full mapping):
+Latency contract: Gemini CLI awaits every hook process until it exits AND
+its stdio pipes close (packages/core/src/hooks/hookRunner.ts, resolve on
+`close`). Each hook therefore does only local-file work synchronously and
+hands network work (OTLP posts, `gh` PR lookup, limits verdict refresh) to
+a detached background child with /dev/null stdio (`--background <spool>`).
+
+Event dispatch (payload shapes: packages/core/src/hooks/types.ts):
 
   SessionStart  → convention prompt + budget standing (additionalContext)
-  BeforeAgent   → spend-limits gate + cardinal.git_state + verdict refresh
-  AfterModel    → api_request + cardinal.turn_usage (per model call)
+  BeforeAgent   → spend-limits gate + decision prompt (additionalContext);
+                  background: cardinal.git_state (+PR) + verdict refresh
+  AfterModel    → api_request + cardinal.turn_usage, final chunk only
+                  (fires per streamed chunk; non-final chunks exit early)
   AfterTool     → cardinal.turn_tool + tool_result (per tool call)
-  AfterAgent    → cardinal.subagent_usage
-  PreCompress   → cardinal.plan_usage (context-window slice)
-  SessionEnd    → best-effort progress-file cleanup
+  AfterAgent    → cardinal.subagent_usage for subagent-shaped payloads only;
+                  not registered by cardinal-connect (Gemini fires it per
+                  main-agent turn with {prompt, prompt_response})
+  PreCompress   → cardinal.plan_usage (compaction trigger)
+  SessionEnd    → no-op
 """
 
 from __future__ import annotations
@@ -30,14 +39,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+# AfterModel fires once per streamed chunk and the host awaits each hook
+# (packages/core/src/core/geminiChat.ts: `await hookSystem.fireAfterModelEvent`
+# inside the chunk loop). Only the final chunk — a candidate carrying
+# finishReason — is accounted, so exit before importing cardinal_core.
+_PRELOADED_STDIN: str | None = None
+if __name__ == "__main__" and sys.argv[1:3] == ["--event", "AfterModel"]:
+    _PRELOADED_STDIN = sys.stdin.read()
+    if '"finishReason"' not in _PRELOADED_STDIN:
+        sys.exit(0)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _plugin_version  # noqa: E402
-from cardinal_core import bashclass, initiative, limits, otlp, pricing, session  # noqa: E402
+from cardinal_core import bashclass, decisions, initiative, limits, otlp, pricing, session  # noqa: E402
 from cardinal_core.paths import AgentPaths  # noqa: E402
 
 
@@ -46,9 +67,17 @@ SCOPE_NAME = "cardinal-gemini-plugin"
 
 PATHS = AgentPaths(home=Path.home() / ".gemini")
 DEBUG_PAYLOADS_ENV = "CARDINAL_GEMINI_DEBUG_PAYLOADS"
+# Test hook: run background jobs inline so OTLP output is deterministic.
+BACKGROUND_INLINE_ENV = "CARDINAL_GEMINI_INLINE_BACKGROUND"
+
+# Decision capture CLI, resolved from this hook's own location so the
+# injected instruction names the installed plugin's absolute path.
+DECISION_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-decision"
+# `gh pr view` bound for the background PR refresh.
+PR_REFRESH_TIMEOUT_SEC = 4.0
 
 TARGET_KEYS = {
-    "read_file": "path",
+    "read_file": "file_path",
     "write_file": "file_path",
     "edit": "file_path",
     "replace": "file_path",
@@ -76,7 +105,12 @@ def session_id_from_payload(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def connected() -> bool:
+    return otlp.connection_from_paths(PATHS) is not None
+
+
 def emit_records(records: list[dict[str, Any]]) -> None:
+    """Synchronous OTLP post — call only from the background child."""
     if not records:
         return
     conn = otlp.connection_from_paths(PATHS)
@@ -97,6 +131,66 @@ def emit_records(records: list[dict[str, Any]]) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Background work — detached child so the host never waits on the network
+# ---------------------------------------------------------------------------
+
+def spawn_background(job: dict[str, Any]) -> None:
+    """Spool `job` (0600) and run it in a detached child. The child gets
+    /dev/null for stdin/stdout/stderr and its own session: Gemini CLI waits
+    for the hook's stdio pipes to close, so an inherited pipe would hold
+    the prompt until the network work finished."""
+    try:
+        spool_dir = PATHS.runtime_dir / "spool"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        path = spool_dir / f"{job.get('kind')}-{os.getpid()}-{time.time_ns()}.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(job, fh, default=str)
+    except (OSError, TypeError, ValueError):
+        return
+    if os.environ.get(BACKGROUND_INLINE_ENV) == "1":
+        run_background_job(path)
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--background", str(path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def emit_in_background(records: list[dict[str, Any]]) -> None:
+    if records and connected():
+        spawn_background({"kind": "emit", "records": records})
+
+
+def run_background_job(path: Path) -> None:
+    try:
+        job = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if not isinstance(job, dict):
+        return
+    kind = job.get("kind")
+    if kind == "emit":
+        records = job.get("records")
+        if isinstance(records, list):
+            emit_records(records)
+    elif kind == "before_agent":
+        before_agent_background(job)
+
+
 def dump_debug_payload(event: str, payload: dict[str, Any]) -> None:
     """Env-gated raw hook-payload dump for shape capture. A no-op unless
     CARDINAL_GEMINI_DEBUG_PAYLOADS=1; best-effort like everything else."""
@@ -114,6 +208,49 @@ def dump_debug_payload(event: str, payload: dict[str, Any]) -> None:
 # BeforeAgent — closest analogue to Claude's UserPromptSubmit
 # ---------------------------------------------------------------------------
 
+def build_decision_context(cli: str, session_id: str, entries: list[dict[str, Any]]) -> str:
+    """Decision-recording instructions + this session's ledger. Gemini CLI
+    HTML-escapes `<`/`>` in additionalContext, so placeholders use braces."""
+    return (
+        "Cardinal decision capture is on for this session. When you make a choice that "
+        "constrains later work (picking between approaches, settling an open question, or "
+        "the user deciding something), record it right away with one run_shell_command call:\n"
+        f'python3 "{cli}" record --session {shlex.quote(session_id)} '
+        '--choice "{the option chosen, 2-7 words}" '
+        '--question "{what had to be settled}" --why "{one sentence}" '
+        '[--alt "{rejected option}"]... [--by user] [--anchor {path}[::Symbol]]... '
+        "[--follows|--refines|--supersedes {id}]\n"
+        "Record choices, not progress, findings, or tool calls. Use --by user when the user "
+        "made the call. Anchor the files or symbols the decision governs. Link a decision to "
+        "an earlier one when it builds on, narrows, or replaces it.\n"
+        "Decisions so far this session:\n"
+        f"{decisions.render_ledger(entries)}"
+    )
+
+
+def decision_context(session_id: str) -> str | None:
+    """None unless decision capture is on (`cardinal-decision on` or
+    CARDINAL_DECISIONS=1). Local file reads only — no network."""
+    if not decisions.is_enabled(PATHS.runtime_dir, os.environ.get(decisions.ENABLE_ENV)):
+        return None
+    entries = decisions.read_ledger(PATHS.runtime_dir, session_id)
+    return build_decision_context(str(DECISION_CLI), session_id, entries)
+
+
+def merge_prompt_output(gate_out: dict[str, Any] | None, extra_context: str | None) -> dict[str, Any] | None:
+    """One BeforeAgent stdout JSON object from the spend-limits gate and the
+    decision prompt. A blocked turn carries only the block verdict."""
+    if not extra_context or (gate_out and gate_out.get("decision") == "block"):
+        return gate_out
+    out = dict(gate_out or {})
+    hso = dict(out.get("hookSpecificOutput") or {})
+    hso["hookEventName"] = "BeforeAgent"
+    prior = hso.get("additionalContext")
+    hso["additionalContext"] = f"{prior}\n\n{extra_context}" if prior else extra_context
+    out["hookSpecificOutput"] = hso
+    return out
+
+
 def handle_before_agent(payload: dict[str, Any]) -> None:
     dump_debug_payload("BeforeAgent", payload)
     session_id = session_id_from_payload(payload)
@@ -121,20 +258,45 @@ def handle_before_agent(payload: dict[str, Any]) -> None:
         return
     cwd = str(payload.get("cwd") or os.getcwd())
 
-    # Sync gate FIRST — its stdout is the hook's verdict channel and must
-    # not wait on any network call below.
+    # Sync half: local files only. The gate verdict and the decision prompt
+    # share one stdout JSON object (Gemini parses a single document).
+    gate_out = None
     try:
         gate_out = limits.gate_output(PATHS, session_id, hook_event_name="BeforeAgent")
-        if gate_out:
-            sys.stdout.write(json.dumps(gate_out))
-            sys.stdout.flush()
     except Exception:
         pass
+    extra_context = None
+    try:
+        extra_context = decision_context(session_id)
+    except Exception:
+        pass
+    prompt_out = merge_prompt_output(gate_out, extra_context)
+    if prompt_out:
+        sys.stdout.write(json.dumps(prompt_out))
+        sys.stdout.flush()
 
     # Turn boundary: user_turn_seq increments; per-turn counters reset.
     state = session.load_progress(PATHS, session_id)
     session.begin_user_turn(state)
     session.save_progress(PATHS, session_id, state)
+
+    # Network half (git_state + PR refresh + verdict refresh) runs detached.
+    if connected():
+        spawn_background({
+            "kind": "before_agent",
+            "session_id": session_id,
+            "cwd": cwd,
+            "command": initiative.detect_command(payload.get("prompt")),
+            "ts_ns": time.time_ns(),
+        })
+
+
+def before_agent_background(job: dict[str, Any]) -> None:
+    session_id = str(job.get("session_id") or "")
+    cwd = str(job.get("cwd") or "")
+    if not session_id or not cwd:
+        return
+    ts_ns = job.get("ts_ns") if isinstance(job.get("ts_ns"), int) else time.time_ns()
 
     branch = None
     repo = None
@@ -144,6 +306,16 @@ def handle_before_agent(payload: dict[str, Any]) -> None:
         remote_url = initiative.git(["remote", "get-url", "origin"], cwd)
         repo = initiative.canonical_repo(remote_url)
         initiative_name, initiative_type = initiative.resolve_initiative(branch)
+        # The branch's PR via `gh` (cached per repo+branch). Unresolved →
+        # keys absent (log_record drops None); never fails the record.
+        pr_number = pr_url = None
+        try:
+            pr_number, pr_url = decisions.resolve_pr(
+                cwd, repo, branch, decisions.cache_dir(PATHS.runtime_dir),
+                timeout=PR_REFRESH_TIMEOUT_SEC,
+            )
+        except Exception:
+            pass
         attrs: dict[str, Any] = {
             "session_id": session_id,
             "cardinal_cwd": cwd,
@@ -153,12 +325,13 @@ def handle_before_agent(payload: dict[str, Any]) -> None:
             "cardinal_remote_url": remote_url,
             "cardinal_initiative_name": initiative_name,
             "cardinal_initiative_type": initiative_type,
-            "cardinal_command": initiative.detect_command(payload.get("prompt")),
+            "cardinal_command": job.get("command"),
+            "cardinal_pr_number": pr_number,
+            "cardinal_pr_url": pr_url,
             **session.read_plan_stamp(PATHS),
         }
-        emit_records([otlp.log_record("cardinal.git_state", attrs, time.time_ns())])
+        emit_records([otlp.log_record("cardinal.git_state", attrs, ts_ns)])
 
-    # Async half of the gate — refresh after the OTLP post, best-effort.
     try:
         limits.maybe_refresh_verdict(PATHS, session_id=session_id, repo=repo, branch=branch)
     except Exception:
@@ -170,10 +343,12 @@ def handle_before_agent(payload: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def normalize_usage(raw: dict[str, Any]) -> dict[str, Any]:
-    """Map Gemini's payload key spellings onto the Cardinal contract's
-    canonical bucket names. Gemini variants observed / documented include
-    `promptTokenCount`, `candidatesTokenCount`, `thoughtsTokenCount`,
-    `cachedContentTokenCount`, `toolUsePromptTokenCount`.
+    """Map Gemini usage keys onto the Cardinal contract's bucket names.
+
+    The hook's LLMResponse.usageMetadata carries only promptTokenCount,
+    candidatesTokenCount and totalTokenCount (hookTranslator.ts
+    toHookLLMResponse); thought + tool-use-prompt tokens are recovered as
+    total - prompt - candidates. Cached-content tokens are not exposed.
     """
     def _int(*keys: str) -> int:
         for k in keys:
@@ -182,7 +357,7 @@ def normalize_usage(raw: dict[str, Any]) -> dict[str, Any]:
                 return int(v)
         return 0
 
-    return {
+    usage = {
         "input_tokens": _int("input_tokens", "prompt_tokens", "promptTokenCount"),
         "output_tokens": _int("output_tokens", "response_tokens", "candidatesTokenCount"),
         "thought_tokens": _int("thought_tokens", "thoughtsTokenCount"),
@@ -192,6 +367,12 @@ def normalize_usage(raw: dict[str, Any]) -> dict[str, Any]:
         ),
         "tool_use_tokens": _int("tool_use_tokens", "toolUsePromptTokenCount"),
     }
+    total = _int("total_tokens", "totalTokenCount")
+    if total and not usage["thought_tokens"]:
+        remainder = total - usage["input_tokens"] - usage["output_tokens"] - usage["tool_use_tokens"]
+        if remainder > 0:
+            usage["thought_tokens"] = remainder
+    return usage
 
 
 def usage_attrs(usage: dict[str, Any]) -> dict[str, Any]:
@@ -204,22 +385,39 @@ def usage_attrs(usage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def final_chunk_usage(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Any]:
+    """(usageMetadata, model) for the stream's final chunk, else (None, None).
+    AfterModelInput = {llm_request: {model, ...}, llm_response: {candidates:
+    [{finishReason?}], usageMetadata?}} (hooks/types.ts, hookTranslator.ts)."""
+    response = payload.get("llm_response")
+    if not isinstance(response, dict):
+        return None, None
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list) or not any(
+        isinstance(c, dict) and c.get("finishReason") for c in candidates
+    ):
+        return None, None
+    meta = response.get("usageMetadata")
+    if not isinstance(meta, dict):
+        return None, None
+    request = payload.get("llm_request")
+    model = request.get("model") if isinstance(request, dict) else None
+    return meta, model
+
+
 def handle_after_model(payload: dict[str, Any]) -> None:
     dump_debug_payload("AfterModel", payload)
     session_id = session_id_from_payload(payload)
     if not session_id:
         return
 
-    # Gemini's AfterModel payload nests token usage under `usage` or
-    # `usageMetadata` depending on version — probe both.
-    raw_usage = payload.get("usage") or payload.get("usageMetadata") or {}
-    if not isinstance(raw_usage, dict):
+    raw_usage, model = final_chunk_usage(payload)
+    if raw_usage is None:
         return
     usage = normalize_usage(raw_usage)
     if not any(usage.values()):
         return
 
-    model = payload.get("model") or payload.get("modelId") or payload.get("model_id")
     state = session.load_progress(PATHS, session_id)
     ts_ns = time.time_ns()
 
@@ -252,15 +450,16 @@ def handle_after_model(payload: dict[str, Any]) -> None:
     if cost_usd is not None:
         base["cost_usd"] = cost_usd
 
-    records: list[dict[str, Any]] = []
-    records.append(otlp.log_record("api_request", base, ts_ns))
-    records.append(otlp.log_record("cardinal.turn_usage", {
-        **base,
-        "ts": ts_ns,
-        "user_turn_seq": state["user_turn_seq"],
-        "turn_seq": state["turn_seq"],
-        **plan_stamp,
-    }, ts_ns + 1))
+    records: list[dict[str, Any]] = [
+        otlp.log_record("api_request", base, ts_ns),
+        otlp.log_record("cardinal.turn_usage", {
+            **base,
+            "ts": ts_ns,
+            "user_turn_seq": state["user_turn_seq"],
+            "turn_seq": state["turn_seq"],
+            **plan_stamp,
+        }, ts_ns + 1),
+    ]
 
     # plan_state: once per session; re-emit on value change.
     plan_sig = f"{plan_stamp.get('plan_type') or ''}|{plan_stamp.get('rate_limit_tier') or ''}"
@@ -274,7 +473,7 @@ def handle_after_model(payload: dict[str, Any]) -> None:
         }, ts_ns + 2))
         state["plan_state_sig"] = plan_sig
 
-    emit_records(records)
+    emit_in_background(records)
     session.end_model_call(state)
     session.save_progress(PATHS, session_id, state)
 
@@ -308,6 +507,28 @@ def normalize_tool(name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]
     return name, {}, None
 
 
+def tool_success(payload: dict[str, Any]) -> str:
+    """AfterToolInput.tool_response = {llmContent, returnDisplay, error?}
+    (core/coreToolHookTriggers.ts); a present `error` means failure."""
+    success = payload.get("success")
+    tool_response = payload.get("tool_response")
+    if success is None and isinstance(tool_response, dict):
+        success = not tool_response.get("error")
+    if success is None:
+        exit_code = payload.get("exit_code") or payload.get("exitCode")
+        if isinstance(exit_code, (int, float)):
+            success = "true" if int(exit_code) == 0 else "false"
+        else:
+            status = payload.get("status")
+            if isinstance(status, str):
+                success = "true" if status.lower() in {"ok", "success", "completed"} else "false"
+    if isinstance(success, bool):
+        return "true" if success else "false"
+    if isinstance(success, str):
+        return success.lower()
+    return "true"
+
+
 def handle_after_tool(payload: dict[str, Any]) -> None:
     dump_debug_payload("AfterTool", payload)
     session_id = session_id_from_payload(payload)
@@ -318,6 +539,16 @@ def handle_after_tool(payload: dict[str, Any]) -> None:
         return
     args = parse_args_json(payload.get("tool_input") or payload.get("toolInput") or payload.get("arguments"))
     tool_name, params, target = normalize_tool(raw_name, args)
+    qualified_name = raw_name
+    # MCP tools carry mcp_context {server_name, tool_name} (hooks/types.ts
+    # McpToolContext); Gemini's own tool_name is not `mcp__`-qualified.
+    mcp_context = payload.get("mcp_context")
+    if isinstance(mcp_context, dict) and mcp_context.get("server_name"):
+        server = str(mcp_context["server_name"])
+        tool = str(mcp_context.get("tool_name") or raw_name)
+        tool_name = "mcp_tool"
+        params = {"mcp_server_name": server, "mcp_tool_name": tool}
+        qualified_name = f"mcp__{server}__{tool}"
     if target is None:
         key = TARGET_KEYS.get(tool_name) or TARGET_KEYS.get(raw_name)
         if key:
@@ -340,9 +571,9 @@ def handle_after_tool(payload: dict[str, Any]) -> None:
         **plan_stamp,
     }
     if tool_name == "mcp_tool":
-        # turn_tool carries the raw qualified MCP name (harvester's clustering
+        # turn_tool carries the qualified MCP name (harvester's clustering
         # signal); tool_result keeps the normalized form.
-        attrs["tool_name"] = raw_name
+        attrs["tool_name"] = qualified_name
         attrs["mcp_server_name"] = params.get("mcp_server_name")
         attrs["mcp_tool_name"] = params.get("mcp_tool_name")
     elif tool_name == "Bash":
@@ -353,43 +584,25 @@ def handle_after_tool(payload: dict[str, Any]) -> None:
             if bash_multi:
                 attrs["bash_multi"] = True
 
-    success = payload.get("success")
-    if success is None:
-        # Fall back to exit_code / status if present.
-        exit_code = payload.get("exit_code") or payload.get("exitCode")
-        if isinstance(exit_code, (int, float)):
-            success = "true" if int(exit_code) == 0 else "false"
-        else:
-            status = payload.get("status")
-            if isinstance(status, str):
-                success = "true" if status.lower() in {"ok", "success", "completed"} else "false"
-    if isinstance(success, bool):
-        success_str = "true" if success else "false"
-    elif isinstance(success, str):
-        success_str = success.lower()
-    else:
-        success_str = "true"
-
     result_attrs: dict[str, Any] = {
         "session_id": session_id,
         "agent_runtime": "gemini",
         "tool_name": tool_name,
-        "success": success_str,
+        "success": tool_success(payload),
         "tool_parameters": json.dumps(params, separators=(",", ":")) if params else None,
         "tool_input": json.dumps(args, separators=(",", ":")) if args else None,
     }
 
-    records = [
+    emit_in_background([
         otlp.log_record("cardinal.turn_tool", attrs, ts_ns),
         otlp.log_record("tool_result", result_attrs, ts_ns + 1),
-    ]
-    emit_records(records)
+    ])
     state["tool_seq"] += 1
     session.save_progress(PATHS, session_id, state)
 
 
 # ---------------------------------------------------------------------------
-# AfterAgent — subagent stop
+# AfterAgent — subagent stop (not registered; see module docstring)
 # ---------------------------------------------------------------------------
 
 def subagent_description_from_payload(payload: dict[str, Any]) -> str | None:
@@ -419,8 +632,12 @@ def handle_after_agent(payload: dict[str, Any]) -> None:
     session_id = session_id_from_payload(payload)
     if not session_id:
         return
+    # Gemini CLI's real AfterAgent is the main agent's turn end
+    # (core/client.ts, outermost call) with {prompt, prompt_response,
+    # stop_hook_active} — not a subagent stop. Never report it as one.
+    if "prompt_response" in payload or "stop_hook_active" in payload:
+        return
 
-    # Gemini's AfterAgent payload usage may nest under several keys.
     usage_block = (
         payload.get("usage")
         or payload.get("usageMetadata")
@@ -450,8 +667,6 @@ def handle_after_agent(payload: dict[str, Any]) -> None:
         ),
         "agent_id": payload.get("agent_id") or payload.get("agentId"),
         "subagent_description": subagent_description_from_payload(payload),
-        # Cross-adapter contract key; best-effort — probe the payload and
-        # its usage block for the child's model.
         "model": (
             payload.get("model")
             or payload.get("modelName")
@@ -463,10 +678,6 @@ def handle_after_agent(payload: dict[str, Any]) -> None:
         "status": payload.get("status"),
         **session.read_plan_stamp(PATHS),
     }
-    # Emit when we have ANY identifying facet — an untyped call with no
-    # description, id, tokens, or duration is almost certainly a stray
-    # payload (Gemini fires AfterAgent for the main agent too on some
-    # versions); skipping those keeps the subagent_usage stream honest.
     identifying = any(
         attrs[k] is not None
         for k in ("subagent_type", "agent_id", "subagent_description",
@@ -474,7 +685,7 @@ def handle_after_agent(payload: dict[str, Any]) -> None:
     )
     if not identifying:
         return
-    emit_records([otlp.log_record("cardinal.subagent_usage", attrs, time.time_ns())])
+    emit_in_background([otlp.log_record("cardinal.subagent_usage", attrs, time.time_ns())])
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +697,8 @@ def handle_pre_compress(payload: dict[str, Any]) -> None:
     session_id = session_id_from_payload(payload)
     if not session_id:
         return
+    # PreCompressInput carries only `trigger` (manual|auto); the context
+    # slice keys are probed in case a future host adds them.
     attrs = {
         "session_id": session_id,
         "agent_runtime": "gemini",
@@ -495,15 +708,13 @@ def handle_pre_compress(payload: dict[str, Any]) -> None:
         "trigger": payload.get("trigger"),
         "messages_to_compact": payload.get("messages_to_compact") or payload.get("messagesToCompact"),
         "is_first_compaction": payload.get("is_first_compaction") or payload.get("isFirstCompaction"),
-        "plan": {"compact_trigger": payload.get("trigger")} if payload.get("trigger") else None,
         **session.read_plan_stamp(PATHS),
     }
-    # Flag disambiguation downstream: presence of `plan.compact_trigger`
-    # distinguishes this from per-model-call plan_usage.
-    if attrs["plan"]:
-        attrs["plan.compact_trigger"] = attrs["plan"]["compact_trigger"]
-    attrs.pop("plan", None)
-    emit_records([otlp.log_record("cardinal.plan_usage", attrs, time.time_ns())])
+    # Presence of `plan.compact_trigger` distinguishes this downstream from
+    # per-model-call plan_usage.
+    if payload.get("trigger"):
+        attrs["plan.compact_trigger"] = payload.get("trigger")
+    emit_in_background([otlp.log_record("cardinal.plan_usage", attrs, time.time_ns())])
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +728,8 @@ def handle_session_start(payload: dict[str, Any]) -> None:
         return
     context = session.convention_prompt("Gemini CLI")
     try:
+        # One bounded (1.5s) limits fetch per session, only when the backend
+        # advertises spend limits; its result is this hook's output.
         standing = session.budget_standing(PATHS, session_id_from_payload(payload), cwd)
         if standing:
             context = f"{context}\n\n{standing}"
@@ -537,9 +750,6 @@ def handle_session_start(payload: dict[str, Any]) -> None:
 
 def handle_session_end(payload: dict[str, Any]) -> None:
     dump_debug_payload("SessionEnd", payload)
-    session_id = session_id_from_payload(payload)
-    if not session_id:
-        return
     # Retention: leave the per-session progress + verdict files behind.
     # cardinal-disconnect removes ~/.gemini/cardinal/ wholesale.
     return
@@ -549,12 +759,31 @@ def handle_session_end(payload: dict[str, Any]) -> None:
 # main
 # ---------------------------------------------------------------------------
 
+HANDLERS = {
+    "SessionStart": handle_session_start,
+    "BeforeAgent": handle_before_agent,
+    "AfterModel": handle_after_model,
+    "AfterTool": handle_after_tool,
+    "AfterAgent": handle_after_agent,
+    "PreCompress": handle_pre_compress,
+    "SessionEnd": handle_session_end,
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--event", required=True)
+    parser.add_argument("--event")
+    parser.add_argument("--background", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    raw = sys.stdin.read()
+    if args.background:
+        try:
+            run_background_job(Path(args.background))
+        except Exception:
+            pass
+        silent_exit()
+
+    raw = _PRELOADED_STDIN if _PRELOADED_STDIN is not None else sys.stdin.read()
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
@@ -562,21 +791,10 @@ def main() -> None:
     if not isinstance(payload, dict):
         payload = {}
 
+    handler = HANDLERS.get(args.event or "")
     try:
-        if args.event == "SessionStart":
-            handle_session_start(payload)
-        elif args.event == "BeforeAgent":
-            handle_before_agent(payload)
-        elif args.event == "AfterModel":
-            handle_after_model(payload)
-        elif args.event == "AfterTool":
-            handle_after_tool(payload)
-        elif args.event == "AfterAgent":
-            handle_after_agent(payload)
-        elif args.event == "PreCompress":
-            handle_pre_compress(payload)
-        elif args.event == "SessionEnd":
-            handle_session_end(payload)
+        if handler:
+            handler(payload)
     except Exception:
         pass
     silent_exit()
