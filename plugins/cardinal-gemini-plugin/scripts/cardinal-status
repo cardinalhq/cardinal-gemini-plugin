@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -17,6 +19,72 @@ EXTENSION_DIR = GEMINI_DIR / "extensions" / "cardinal"
 STATE_PATH = GEMINI_DIR / "cardinal.json"
 SECRETS_PATH = GEMINI_DIR / "cardinal-secrets.json"
 MCP_SERVER_NAME = "cardinal"
+HOOK_MARKER = "cardinal-gemini-plugin"
+# Gemini CLI reads hook `timeout` in milliseconds; plugin versions before
+# 0.17 wrote 5, which kills every hook before it can answer.
+MIN_HOOK_TIMEOUT_MS = 1000
+# Hooks are on by default from Gemini CLI 0.26.0 (hooksConfig.enabled).
+MIN_GEMINI_VERSION = (0, 26, 0)
+
+
+def _cardinal_handlers(event_map: object):
+    if not isinstance(event_map, dict):
+        return
+    for event, groups in event_map.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                continue
+            for handler in handlers:
+                if isinstance(handler, dict) and HOOK_MARKER in str(handler.get("command") or ""):
+                    yield event, handler
+
+
+def _short_timeout_events(event_map: object) -> list[str]:
+    return sorted({
+        event for event, handler in _cardinal_handlers(event_map)
+        if isinstance(handler.get("timeout"), (int, float)) and handler["timeout"] < MIN_HOOK_TIMEOUT_MS
+    })
+
+
+def hook_registration_problems(settings: dict) -> list[str]:
+    """Local-file checks for hook registrations that Gemini CLI silently
+    ignores (no top-level `hooks` key) or kills (seconds-style timeouts)."""
+    problems = []
+    hooks_file = EXTENSION_DIR / "hooks" / "hooks.json"
+    if hooks_file.exists():
+        try:
+            data = json.loads(hooks_file.read_text())
+        except Exception:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+            problems.append(f"{hooks_file} has no top-level \"hooks\" object, so Gemini CLI loads none of Cardinal's hooks.")
+        else:
+            short = _short_timeout_events(data["hooks"])
+            if short:
+                problems.append(f"{hooks_file} sets hook timeouts under {MIN_HOOK_TIMEOUT_MS}ms for {', '.join(short)}.")
+    short = _short_timeout_events(settings.get("hooks"))
+    if short:
+        problems.append(f"{SETTINGS_PATH} sets Cardinal hook timeouts under {MIN_HOOK_TIMEOUT_MS}ms for {', '.join(short)}.")
+    return problems
+
+
+def hooks_disabled_reason(settings: dict) -> str | None:
+    hooks_config = settings.get("hooksConfig")
+    if isinstance(hooks_config, dict) and hooks_config.get("enabled") is False:
+        return "hooksConfig.enabled is false in settings.json"
+    return None
+
+
+def gemini_version() -> tuple[int, int, int] | None:
+    try:
+        out = subprocess.run(["gemini", "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout or "")
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
 def load_json(path: Path, label: str) -> dict:
@@ -164,6 +232,20 @@ def main() -> int:
                 print(msg)
                 if msg.startswith("FAIL"):
                     failures += 1
+
+    for problem in hook_registration_problems(settings):
+        print(f"FAIL {problem} Re-run cardinal-connect to rewrite it, then restart Gemini CLI.")
+        failures += 1
+    disabled = hooks_disabled_reason(settings)
+    if disabled:
+        print(f"WARN Gemini CLI hooks are disabled ({disabled}); Cardinal hook telemetry will not run.")
+    version = gemini_version()
+    if version and version < MIN_GEMINI_VERSION:
+        print(
+            f"WARN Gemini CLI {'.'.join(map(str, version))} predates 0.26.0, where hooks are on by default. "
+            "Upgrade, or enable hooks in ~/.gemini/settings.json: "
+            "\"hooks\": {\"enabled\": true} on 0.24-0.25, \"tools\": {\"enableHooks\": true} on 0.21-0.23."
+        )
 
     print()
     print("Restart Gemini CLI if you connected or disconnected in the current process.")

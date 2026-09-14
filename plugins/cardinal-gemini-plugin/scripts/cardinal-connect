@@ -61,6 +61,118 @@ STATE_PATH = PATHS.state_path
 SECRETS_PATH = PATHS.secrets_path
 PENDING_PATH = PATHS.pending_path
 
+HOOK_MARKER = "cardinal-gemini-plugin"
+# Gemini CLI reads hook `timeout` in MILLISECONDS and, on expiry, kills the
+# hook and drops its output (packages/core/src/hooks/hookRunner.ts). Hooks
+# do only local work synchronously (network runs in a detached child); the
+# bound covers SessionStart's one 1.5s limits fetch with headroom.
+HOOK_TIMEOUT_MS = 10000
+# AfterAgent is not registered: Gemini fires it once per main-agent turn,
+# not per subagent, so it has nothing to report.
+REGISTERED_EVENTS = (
+    "SessionStart", "BeforeAgent", "AfterModel", "AfterTool", "PreCompress", "SessionEnd",
+)
+
+
+def _is_cardinal_group(group: object) -> bool:
+    if not isinstance(group, dict):
+        return False
+    if group.get("cardinalManaged"):
+        return True
+    handlers = group.get("hooks")
+    return isinstance(handlers, list) and any(
+        isinstance(h, dict) and HOOK_MARKER in str(h.get("command") or "") for h in handlers
+    )
+
+
+def _cardinal_signature(hooks_root: object) -> list:
+    if not isinstance(hooks_root, dict):
+        return []
+    return sorted(
+        (event, str(h.get("command")), h.get("timeout"))
+        for event, groups in hooks_root.items() if isinstance(groups, list)
+        for g in groups if _is_cardinal_group(g)
+        for h in g.get("hooks") or [] if isinstance(h, dict)
+    )
+
+
+def set_cardinal_hook_entries(hooks_root: object) -> dict:
+    """settings.json `hooks` with every Cardinal group removed (any event,
+    including retired registrations such as AfterAgent) and the current
+    registrations appended. Non-Cardinal entries are left untouched."""
+    root = dict(hooks_root) if isinstance(hooks_root, dict) else {}
+    for event, groups in list(root.items()):
+        if not isinstance(groups, list):
+            continue
+        kept = [g for g in groups if not _is_cardinal_group(g)]
+        if kept:
+            root[event] = kept
+        else:
+            root.pop(event)
+    for event in REGISTERED_EVENTS:
+        groups = root.get(event) if isinstance(root.get(event), list) else []
+        groups.append({
+            "matcher": "",
+            "cardinalManaged": True,
+            "hooks": [{
+                "type": "command",
+                "command": (
+                    f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
+                    f"--event {shlex.quote(event)} # {HOOK_MARKER}"
+                ),
+                "timeout": HOOK_TIMEOUT_MS,
+            }],
+        })
+        root[event] = groups
+    return root
+
+
+def render_extension_hooks() -> str:
+    """extension/hooks/hooks.json with `__HOOK_SCRIPT__` patched to this
+    plugin's absolute telemetry hook path."""
+    hooks_src = (EXTENSION_SOURCE / "hooks" / "hooks.json").read_text()
+    return hooks_src.replace("__HOOK_SCRIPT__", shlex.quote(str(HOOK_SCRIPT)).strip("'"))
+
+
+def write_extension_hooks(target_dir: Path) -> None:
+    (target_dir / "hooks").mkdir(parents=True, exist_ok=True)
+    (target_dir / "hooks" / "hooks.json").write_text(render_extension_hooks())
+
+
+def repair_hook_registration() -> list[str]:
+    """Rewrite existing Cardinal hook registrations in place, without new
+    credentials. Installs from plugin versions before 0.17 wrote a
+    hooks.json that Gemini CLI rejects (no top-level `hooks` key) and
+    seconds-style timeouts (5 = 5ms); re-running cardinal-connect fixes
+    both. Returns the paths rewritten."""
+    repaired: list[str] = []
+    manifest = EXTENSION_INSTALL_DIR / "gemini-extension.json"
+    if manifest.exists():
+        try:
+            ours = bool(json.loads(manifest.read_text()).get("cardinalManaged"))
+        except (OSError, ValueError, AttributeError):
+            ours = False
+        hooks_file = EXTENSION_INSTALL_DIR / "hooks" / "hooks.json"
+        try:
+            current = hooks_file.read_text()
+        except OSError:
+            current = None
+        if ours and current != render_extension_hooks():
+            write_extension_hooks(EXTENSION_INSTALL_DIR)
+            repaired.append(str(hooks_file))
+    if SETTINGS_PATH.exists():
+        settings = load_json_object(SETTINGS_PATH, "settings.json")
+        hooks_root = settings.get("hooks")
+        signature = _cardinal_signature(hooks_root)
+        if signature:
+            updated = set_cardinal_hook_entries(hooks_root)
+            if _cardinal_signature(updated) != signature:
+                backup(SETTINGS_PATH)
+                settings["hooks"] = updated
+                atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+                repaired.append(str(SETTINGS_PATH))
+    return repaired
+
 
 def write_pending(grant: dict) -> None:
     payload = {
@@ -129,12 +241,7 @@ def install_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> None:
     )
 
     # hooks/hooks.json — patch __HOOK_SCRIPT__ placeholder.
-    hooks_src = (EXTENSION_SOURCE / "hooks" / "hooks.json").read_text()
-    hooks_patched = hooks_src.replace(
-        "__HOOK_SCRIPT__", shlex.quote(str(HOOK_SCRIPT)).strip("'")
-    )
-    (EXTENSION_INSTALL_DIR / "hooks").mkdir(exist_ok=True)
-    (EXTENSION_INSTALL_DIR / "hooks" / "hooks.json").write_text(hooks_patched)
+    write_extension_hooks(EXTENSION_INSTALL_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -179,36 +286,7 @@ def apply_settings(ingest: dict, mcp_url: str | None, mcp_key: str | None,
             }
             settings["mcpServers"] = servers
 
-        hooks_root = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
-        for event, timeout in (
-            ("SessionStart", 5),
-            ("BeforeAgent", 5),
-            ("AfterModel", 5),
-            ("AfterTool", 5),
-            ("AfterAgent", 5),
-            ("PreCompress", 5),
-            ("SessionEnd", 5),
-        ):
-            groups = hooks_root.get(event) if isinstance(hooks_root.get(event), list) else []
-            # Strip prior Cardinal-managed entries before re-appending.
-            groups = [
-                g for g in groups
-                if not (isinstance(g, dict) and g.get("cardinalManaged"))
-            ]
-            groups.append({
-                "matcher": "",
-                "cardinalManaged": True,
-                "hooks": [{
-                    "type": "command",
-                    "command": (
-                        f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
-                        f"--event {shlex.quote(event)} # cardinal-gemini-plugin"
-                    ),
-                    "timeout": timeout,
-                }],
-            })
-            hooks_root[event] = groups
-        settings["hooks"] = hooks_root
+        settings["hooks"] = set_cardinal_hook_entries(settings.get("hooks"))
 
     backup_path = backup(SETTINGS_PATH)
     atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
@@ -390,6 +468,15 @@ def main() -> int:
         except Exception:
             prior = {}
         user = prior.get("user_email") or "this account"
+        # Re-running on an existing connection refreshes the hook
+        # registration in place (fixes installs from older plugin versions).
+        repaired = repair_hook_registration()
+        if repaired:
+            print("Refreshed Cardinal hook registration (credentials unchanged):")
+            for path in repaired:
+                print(f"  {path}")
+            print(f"Cardinal is already connected as {user}. Restart Gemini CLI so it reloads hooks.")
+            return 0
         sys.stderr.write(
             f"Cardinal is already connected as {user}. "
             "Re-run with --rotate to overwrite.\n"
