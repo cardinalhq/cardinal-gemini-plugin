@@ -251,12 +251,15 @@ def install_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> None:
 _TELEMETRY_KEY = "telemetry"
 
 
-def apply_settings(ingest: dict, mcp_url: str | None, mcp_key: str | None,
+def apply_settings(ingest: dict | None, mcp_url: str | None, mcp_key: str | None,
                    include_hooks: bool) -> Path | None:
     """Merge Cardinal-managed keys into ~/.gemini/settings.json.
 
-    Always writes:
+    Always writes (when the bundle carried an ingest credential):
       - `telemetry` block pointing at Cardinal's OTLP ingest endpoint.
+    Without one (org has no Lakerunner / server has no ingest endpoint), a
+    Cardinal-managed `telemetry` block from a prior connect is removed so
+    Gemini stops exporting to it; a user-owned block is left alone.
 
     When `include_hooks=True` (no-extension install path only):
       - `mcpServers.cardinal`
@@ -265,16 +268,21 @@ def apply_settings(ingest: dict, mcp_url: str | None, mcp_key: str | None,
     """
     settings = load_json_object(SETTINGS_PATH, "settings.json")
 
-    settings[_TELEMETRY_KEY] = {
-        "enabled": True,
-        "target": "otlp",
-        "otlpEndpoint": str(ingest["endpoint"]).rstrip("/") + "/v1/logs",
-        "otlpHeaders": {
-            (ingest.get("api_header") or "x-cardinalhq-api-key"): ingest["api_key"],
-        },
-        "logPrompts": False,
-        "cardinalManaged": True,
-    }
+    if ingest:
+        settings[_TELEMETRY_KEY] = {
+            "enabled": True,
+            "target": "otlp",
+            "otlpEndpoint": str(ingest["endpoint"]).rstrip("/") + "/v1/logs",
+            "otlpHeaders": {
+                (ingest.get("api_header") or "x-cardinalhq-api-key"): ingest["api_key"],
+            },
+            "logPrompts": False,
+            "cardinalManaged": True,
+        }
+    else:
+        existing = settings.get(_TELEMETRY_KEY)
+        if isinstance(existing, dict) and existing.get("cardinalManaged"):
+            settings.pop(_TELEMETRY_KEY)
 
     if include_hooks:
         if mcp_url and mcp_key:
@@ -333,6 +341,10 @@ def write_state(bundle: dict, host: str, deployment_env: str,
         "secrets_path": str(SECRETS_PATH),
         "telemetry": {"enabled": bool(ingest)},
     }
+    reason = deviceflow.ingest_unavailable_reason(bundle)
+    if reason:
+        # Why the server minted no ingest key, so cardinal-status can say so.
+        state["telemetry"]["unavailable_reason"] = reason
     if ingest:
         state["ingest_endpoint"] = ingest.get("endpoint")
         state["ingest_key_id"] = ingest.get("key_id")
@@ -370,8 +382,17 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     ingest = bundle.get("ingest")
     mcp = bundle.get("mcp")
 
-    if not ingest:
-        sys.exit("Cardinal did not return an ingest credential. Check the requested scopes.")
+    # Set when the server granted the other scopes but minted no ingest key
+    # (org has no Lakerunner, or no ingest endpoint configured). Connect goes
+    # on without telemetry as long as there is an MCP credential to wire.
+    ingest_reason = deviceflow.ingest_unavailable_reason(bundle)
+
+    if not ingest and not mcp:
+        sys.exit(
+            "Cardinal did not return an ingest credential "
+            f"({deviceflow.ingest_unavailable_note(ingest_reason or 'unknown', mcp_connected=False)}). "
+            "Nothing to connect."
+        )
     if not args.telemetry_only and not mcp:
         sys.exit("Cardinal did not return an MCP credential. Check the requested scopes.")
 
@@ -387,16 +408,20 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                 "extension_dir": str(EXTENSION_INSTALL_DIR) if not args.no_extension else None,
                 "state": str(STATE_PATH),
                 "secrets": str(SECRETS_PATH),
-                "ingest_endpoint": ingest.get("endpoint"),
+                "ingest_endpoint": (ingest or {}).get("endpoint"),
+                "ingest_unavailable_reason": ingest_reason,
                 "mcp_url": (mcp or {}).get("url"),
             },
         }, indent=2))
         return 0
 
-    ok, msg = deviceflow.verify_ingest_reachable(ingest)
-    if not ok:
-        sys.exit(f"Ingest reachability failed: {msg}")
-    print(f"Ingest endpoint reachable ({msg})")
+    # No ingest credential: nothing to probe, and no telemetry config to
+    # write — skip rather than abort so the MCP config still gets written.
+    if ingest:
+        ok, msg = deviceflow.verify_ingest_reachable(ingest)
+        if not ok:
+            sys.exit(f"Ingest reachability failed: {msg}")
+        print(f"Ingest endpoint reachable ({msg})")
 
     if mcp:
         ok, msg = deviceflow.verify_mcp_reachable(mcp.get("url"), mcp.get("api_key"))
@@ -417,7 +442,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     settings_backup = apply_settings(
         ingest, mcp_url, mcp_key, include_hooks=args.no_extension
     )
-    print(f"Wrote Cardinal telemetry config to {SETTINGS_PATH}")
+    print(f"Wrote Cardinal {'telemetry ' if ingest else ''}config to {SETTINGS_PATH}")
     if settings_backup:
         print(f"Settings backup: {settings_backup}")
 
@@ -429,7 +454,11 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     print()
     print(f"Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
-    print(f"Telemetry endpoint: {ingest['endpoint']}")
+    if ingest:
+        print(f"Telemetry endpoint: {ingest['endpoint']}")
+    else:
+        print(f"WARN {deviceflow.ingest_unavailable_note(ingest_reason or 'unknown', mcp_connected=bool(mcp))}")
+        print("     Re-run cardinal-connect --rotate once telemetry ingest is available.")
     if mcp:
         print(f"MCP endpoint: {mcp['url']}")
     print()
