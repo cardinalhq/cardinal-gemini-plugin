@@ -70,8 +70,11 @@ HOOK_TIMEOUT_MS = 10000
 # AfterAgent is not registered: Gemini fires it once per main-agent turn,
 # not per subagent, so it has nothing to report.
 REGISTERED_EVENTS = (
-    "SessionStart", "BeforeAgent", "AfterModel", "AfterTool", "PreCompress", "SessionEnd",
+    "SessionStart", "BeforeAgent", "BeforeTool", "AfterModel", "AfterTool", "PreCompress", "SessionEnd",
 )
+# Matchers (a regex Gemini searches in the tool name); "" for the rest.
+# BeforeTool runs only for Cardinal's storyboard tools (context stamping).
+EVENT_MATCHERS = {"BeforeTool": "storyboard__(create|add_act|publish|find)$"}
 
 
 def _is_cardinal_group(group: object) -> bool:
@@ -89,7 +92,7 @@ def _cardinal_signature(hooks_root: object) -> list:
     if not isinstance(hooks_root, dict):
         return []
     return sorted(
-        (event, str(h.get("command")), h.get("timeout"))
+        (event, str(g.get("matcher") or ""), str(h.get("command")), h.get("timeout"))
         for event, groups in hooks_root.items() if isinstance(groups, list)
         for g in groups if _is_cardinal_group(g)
         for h in g.get("hooks") or [] if isinstance(h, dict)
@@ -112,7 +115,7 @@ def set_cardinal_hook_entries(hooks_root: object) -> dict:
     for event in REGISTERED_EVENTS:
         groups = root.get(event) if isinstance(root.get(event), list) else []
         groups.append({
-            "matcher": "",
+            "matcher": EVENT_MATCHERS.get(event, ""),
             "cardinalManaged": True,
             "hooks": [{
                 "type": "command",

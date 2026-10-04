@@ -21,11 +21,14 @@ a detached background child with /dev/null stdio (`--background <spool>`).
 
 Event dispatch (payload shapes: packages/core/src/hooks/types.ts):
 
-  SessionStart  → convention prompt + budget standing (additionalContext)
+  SessionStart  → convention prompt + budget standing + storyboard session
+                  id and discovery block (additionalContext)
   BeforeAgent   → spend-limits gate + decision prompt (additionalContext);
                   background: cardinal.git_state (+PR) + verdict refresh
   AfterModel    → api_request + cardinal.turn_usage, final chunk only
                   (fires per streamed chunk; non-final chunks exit early)
+  BeforeTool    → storyboard context stamping on Cardinal's storyboard
+                  tools only (matcher), via hookSpecificOutput.tool_input
   AfterTool     → cardinal.turn_tool + tool_result (per tool call); every
                   tool call (built-in or MCP, succeeded or failed; not
                   Cardinal's own) is also captured in the local evidence
@@ -768,10 +771,129 @@ def capture_evidence(payload: dict[str, Any]) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Storyboard associations (cardinal_core.storyboard_agent): the session id +
+# discovery block at SessionStart, the files write_file / replace edited
+# (recorded in the AfterTool run: no new hook process), and context stamping
+# on Cardinal's storyboard tools (BeforeTool: Gemini applies a returned
+# hookSpecificOutput.tool_input to the call). Payload shapes captured from
+# gemini 0.50.0 (tests/test_gemini_storyboard.py fixtures).
+# ---------------------------------------------------------------------------
+
+STORYBOARD_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-storyboard"
+STORYBOARD_SERVER = "cardinal"
+# The four tools stamped_input fills (link's about refs are the model's);
+# the same set as the BeforeTool matcher.
+STORYBOARD_TOOL_RE = re.compile(r"^storyboard__(create|add_act|publish|find)$")
+STORYBOARD_FLAT_RE = re.compile(r"^mcp_cardinal_storyboard__(create|add_act|publish|find)$")
+# The BeforeTool handler cardinal-connect registers (extension hooks.json,
+# or settings.json without the extension).
+BEFORE_TOOL_HOOK_NEEDLE = f"--event BeforeTool # {SCOPE_NAME}"
+EDIT_TOOLS = ("write_file", "replace", "edit")
+
+
+def storyboard_wiring():
+    from cardinal_core import storyboard_agent
+
+    return storyboard_agent.Wiring("gemini", PATHS, PLUGIN_VERSION, cli=str(STORYBOARD_CLI))
+
+
+def storyboard_tool(payload: dict[str, Any]) -> str | None:
+    """The storyboard tool's short name (create, add_act, publish, find)
+    of a call to Cardinal's MCP server, else None. mcp_context
+    {server_name, tool_name} first (the flattened mcp_<server>_<tool> name
+    is ambiguous); the flattened name only without it."""
+    mcp_context = payload.get("mcp_context")
+    if isinstance(mcp_context, dict) and mcp_context.get("server_name"):
+        if mcp_context.get("server_name") != STORYBOARD_SERVER:
+            return None
+        m = STORYBOARD_TOOL_RE.match(str(mcp_context.get("tool_name") or ""))
+        return m.group(1) if m else None
+    m = STORYBOARD_FLAT_RE.match(str(payload.get("tool_name") or ""))
+    return m.group(1) if m else None
+
+
+def edited_file(payload: dict[str, Any]) -> str | None:
+    """The file a successful write_file / replace call edited: tool_input
+    file_path (as the model gave it, relative to cwd or absolute), else
+    returnDisplay.filePath (absolute). None for another tool or a failed
+    call (a present `error`)."""
+    if payload.get("tool_name") not in EDIT_TOOLS:
+        return None
+    response = payload.get("tool_response")
+    if not isinstance(response, dict) or gemini_error_text(response) is not None:
+        return None
+    tool_input = payload.get("tool_input")
+    path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    if not (isinstance(path, str) and path):
+        display = response.get("returnDisplay")
+        path = display.get("filePath") if isinstance(display, dict) else None
+    return path if isinstance(path, str) and path else None
+
+
+def record_edit(payload: dict[str, Any]) -> None:
+    try:
+        path = edited_file(payload)
+        if path is None:
+            return
+        from cardinal_core import storyboard_agent
+
+        cwd = payload.get("cwd")
+        storyboard_agent.record_edits(storyboard_wiring(), session_id_from_payload(payload), [path],
+                                      cwd if isinstance(cwd, str) else None)
+    except Exception:
+        pass
+
+
+def stamping_registered() -> bool:
+    """Whether a Cardinal BeforeTool handler is registered: in the installed
+    extension's hooks/hooks.json, or ~/.gemini/settings.json `hooks` (a
+    no-extension install). An upgraded plugin runs this code before
+    cardinal-connect has re-registered hooks (the old extension copy has
+    no BeforeTool)."""
+    from cardinal_core import storyboard_agent
+
+    gemini = Path.home() / ".gemini"
+    return any(storyboard_agent.hooks_file_registers(path, "BeforeTool", BEFORE_TOOL_HOOK_NEEDLE)
+               for path in (gemini / "extensions" / "cardinal" / "hooks" / "hooks.json",
+                            gemini / "settings.json"))
+
+
+def auto_context(wiring) -> bool:
+    """Whether BeforeTool will fill an absent session_id / context: not
+    turned off with CARDINAL_STORYBOARD_CONTEXT=0, and registered."""
+    return not wiring.context_disabled() and stamping_registered()
+
+
+def handle_before_tool(payload: dict[str, Any]) -> None:
+    """BeforeTool on Cardinal's storyboard tools: fill an absent session_id /
+    context (storyboard_agent.stamped_input) by returning the stamped
+    tool_input. Prints nothing (the call runs unchanged) when nothing was
+    added or on any failure; CARDINAL_STORYBOARD_CONTEXT=0 opts out."""
+    dump_debug_payload("BeforeTool", payload)
+    tool = storyboard_tool(payload)
+    if tool is None:
+        return
+    from cardinal_core import storyboard_agent
+
+    out = storyboard_agent.stamped_input(storyboard_wiring(), tool, payload.get("tool_input"),
+                                         session_id_from_payload(payload), payload.get("cwd"))
+    if out is None:
+        return
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "BeforeTool",
+            "tool_input": out,
+        }
+    }))
+    sys.stdout.flush()
+
+
 def handle_after_tool(payload: dict[str, Any]) -> None:
     dump_debug_payload("AfterTool", payload)
     session_id = session_id_from_payload(payload)
     evidence_line = capture_evidence(payload)
+    record_edit(payload)
     if evidence_line:
         sys.stdout.write(json.dumps({
             "hookSpecificOutput": {
@@ -972,17 +1094,33 @@ def handle_pre_compress(payload: dict[str, Any]) -> None:
 def handle_session_start(payload: dict[str, Any]) -> None:
     dump_debug_payload("SessionStart", payload)
     cwd = str(payload.get("cwd") or os.getcwd())
-    if not initiative.is_git_repo(cwd):
-        return
-    context = session.convention_prompt("Gemini CLI")
+    parts: list[str] = []
+    if initiative.is_git_repo(cwd):
+        context = session.convention_prompt("Gemini CLI")
+        try:
+            # One bounded (1.5s) limits fetch per session, only when the backend
+            # advertises spend limits; its result is this hook's output.
+            standing = session.budget_standing(PATHS, session_id_from_payload(payload), cwd)
+            if standing:
+                context = f"{context}\n\n{standing}"
+        except Exception:
+            pass
+        parts.append(context)
     try:
-        # One bounded (1.5s) limits fetch per session, only when the backend
-        # advertises spend limits; its result is this hook's output.
-        standing = session.budget_standing(PATHS, session_id_from_payload(payload), cwd)
-        if standing:
-            context = f"{context}\n\n{standing}"
+        # The session id line (any directory) + the storyboards that may
+        # relate to this checkout (2 s network deadline; the hook has 10 s).
+        from cardinal_core import storyboard_agent
+
+        wiring = storyboard_wiring()
+        storyboard = storyboard_agent.session_start_text(
+            wiring, cwd, session_id_from_payload(payload), auto_context=auto_context(wiring))
+        if storyboard:
+            parts.append(storyboard)
     except Exception:
         pass
+    if not parts:
+        return
+    context = "\n\n".join(parts)
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -1010,6 +1148,7 @@ def handle_session_end(payload: dict[str, Any]) -> None:
 HANDLERS = {
     "SessionStart": handle_session_start,
     "BeforeAgent": handle_before_agent,
+    "BeforeTool": handle_before_tool,
     "AfterModel": handle_after_model,
     "AfterTool": handle_after_tool,
     "AfterAgent": handle_after_agent,
