@@ -57,6 +57,47 @@ locked to real key names.
 
 The `AfterTool` hook records every tool call, succeeded or failed (Gemini's own tools such as `run_shell_command` and `read_file`, any MCP tool identified by `mcp_context`, and any tool Gemini adds later), in the local evidence spool shared with the other adapters: `~/.cardinal/evidence/<session_id>/ev_<id>.json` (directories 0700, files 0600). The shared pipeline (`cardinal_core.evidence_capture`) decides without naming any tool: a call that touches something sensitive (a `.env` or key file, `~/.aws`, `printenv`, `gh auth token`, a credentialed URL or header) is kept only as a *withheld* stub; everything else is scrubbed, capped at 256 KiB and removed after 14 days. Gemini's `<untrusted_context>` wrapper is removed so the spool keeps what the tool returned, and `mcp_context`'s connection details (command, args, url) are never recorded. A failed call is kept with status `error`. The hook returns `[evidence:ev_…]` as `additionalContext`. Entries name the client `gemini/<version>`, read from the installed `@google/gemini-cli` package (`gemini` alone when it cannot be found). Nothing leaves the machine: `scripts/cardinal-evidence promote --storyboard sb_… ev_…` uploads only what a storyboard cites, with the connection's MCP key. Cardinal's own `cardinal` server is skipped. Opt out with `CARDINAL_EVIDENCE_CAPTURE=0` or the flag file `~/.cardinal/evidence/disabled`. Capture is local file work and fails open.
 
+## Storyboard associations
+
+Where a storyboard is written from (repo, branch, PR, HEAD, the files this
+session edited) is recorded on each act as its `context`, and storyboards
+that may relate to the checkout are shown at session start. Shared logic:
+`cardinal_core.storyboard_agent`.
+
+- **SessionStart** (the existing hook): when Cardinal MCP is connected,
+  `additionalContext` names this session's id (for `storyboard__create`,
+  `storyboard__add_act` and `storyboard__find` `session_id`) and
+  `scripts/cardinal-storyboard context --bare --session-id <id>` (the
+  `context` object itself; without `--bare` it is wrapped in
+  `{"context": {…}}`). It says the plugin fills context only when the
+  `BeforeTool` handler is registered (the installed extension's
+  `hooks/hooks.json`, or `settings.json`) and not turned off; otherwise it
+  names the CLI as the way to pass it. Plus the
+  storyboards that may relate to this branch, PR or commit (at most 3, 2 KB,
+  framed as data; gh cache only, a 2 s network deadline,
+  `X-Cardinal-Client: gemini/<plugin version>`). Off:
+  `CARDINAL_STORYBOARD_DISCOVERY=0` (the storyboards) or
+  `CARDINAL_STORYBOARD_SESSION_START=0` (all of it).
+- **Edited files**: the `AfterTool` run records the file a successful
+  `write_file` or `replace` edited (`tool_input.file_path`, else
+  `returnDisplay.filePath`) for `context.paths`.
+- **Automatic context** (`BeforeTool`, matcher
+  `storyboard__(create|add_act|publish|find)$`): on Cardinal's own server
+  (`mcp_context.server_name` `cardinal`) it returns
+  `hookSpecificOutput.tool_input` with an absent `session_id` and an absent
+  or `{}` `context` filled; it never changes what the model set, never
+  writes `about`, and stamps `publish` only once the server has advertised
+  associations. Gemini's internal tools (`update_topic`) are ignored. Off:
+  `CARDINAL_STORYBOARD_CONTEXT=0`.
+
+Evidence (gemini 0.50.0, captured 2026-10-03 with a project-level
+`.gemini/settings.json`): `write_file` `{file_path, content}` and `replace`
+`{file_path, old_string, new_string, instruction}` with `file_path` as the
+model gave it; MCP calls carry `mcp_context {server_name, tool_name}`; a
+`BeforeTool` `hookSpecificOutput.tool_input` reached the MCP server
+rewritten. Fixtures: `tests/test_gemini_storyboard.py`. Re-run
+`cardinal-connect` to register `BeforeTool`.
+
 ## Session context & spend limits
 
 Parity features with the Claude, Codex, and Cursor plugins, driven by the
