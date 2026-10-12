@@ -1,5 +1,5 @@
 {
-  "_comment": "Extension-scoped hook registrations. Gemini CLI's extension loader requires the event map under a top-level `hooks` key, and `timeout` is in milliseconds. AfterAgent is deliberately not registered: Gemini fires it once per main-agent turn, not per subagent. The `command` string is rewritten by cardinal-connect at install time to reference the plugin's absolute path. BeforeTool is matched (a regex searched in the tool name) to Cardinal's storyboard tools only: it stamps their context.",
+  "_comment": "Extension-scoped hook registrations (cardinal-connect HOOK_GROUPS; tests/test_connect.py keeps them equal). Gemini CLI's extension loader requires the event map under a top-level `hooks` key, and `timeout` is in milliseconds. The `command` string is rewritten by cardinal-connect at install time to reference the plugin's absolute path. BeforeTool is matched (a regex searched in the tool name) to Cardinal's storyboard tools only: it stamps their context. A second BeforeTool group (`--role checks-gate`, matcher `^activate_skill$`) denies the built-in activate_skill for the checks skill while the Checks preview is off. Gemini dedupes an event's hooks by name:command, so the second AfterTool group (the storyboard__preview render, 150 s) carries `--role preview`. AfterAgent is the main agent's turn end: it flushes owner input and stages advisories, and never blocks.",
   "hooks": {
     "SessionStart": [
       {
@@ -35,6 +35,16 @@
             "timeout": 10000
           }
         ]
+      },
+      {
+        "matcher": "^activate_skill$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__ --event BeforeTool --role checks-gate # cardinal-gemini-plugin",
+            "timeout": 10000
+          }
+        ]
       }
     ],
     "AfterModel": [
@@ -56,6 +66,28 @@
           {
             "type": "command",
             "command": "python3 __HOOK_SCRIPT__ --event AfterTool # cardinal-gemini-plugin",
+            "timeout": 10000
+          }
+        ]
+      },
+      {
+        "matcher": "storyboard__preview$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__ --event AfterTool --role preview # cardinal-gemini-plugin",
+            "timeout": 150000
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__ --event AfterAgent # cardinal-gemini-plugin",
             "timeout": 10000
           }
         ]

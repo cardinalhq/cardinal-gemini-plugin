@@ -10,7 +10,7 @@ Use this skill when the user asks to disconnect Gemini CLI from Cardinal, remove
 Run:
 
 ```bash
-python3 scripts/cardinal-disconnect
+python3 "__CARDINAL_PLUGIN_ROOT__/scripts/cardinal-disconnect"
 ```
 
 The script best-effort revokes the recorded ingest and MCP keys server-side, then removes the extension bundle at `~/.gemini/extensions/cardinal/` (only when tagged `cardinalManaged: true`), strips managed `telemetry` / `mcpServers` / `hooks` entries from `~/.gemini/settings.json`, and deletes `~/.gemini/cardinal.json`, `~/.gemini/cardinal-secrets.json`, and `~/.gemini/cardinal/`.

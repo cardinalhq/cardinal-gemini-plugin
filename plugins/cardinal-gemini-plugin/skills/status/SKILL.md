@@ -10,7 +10,7 @@ Use this skill when the user asks whether Cardinal is connected, what workspace 
 Run:
 
 ```bash
-python3 scripts/cardinal-status
+python3 "__CARDINAL_PLUGIN_ROOT__/scripts/cardinal-status"
 ```
 
 The script prints the recorded workspace, key prefixes, and file paths, then probes the ingest and MCP endpoints. If it exits non-zero, one of those probes failed — suggest `cardinal-connect --rotate` if a key appears invalid, or check network reachability to the recorded endpoints.
