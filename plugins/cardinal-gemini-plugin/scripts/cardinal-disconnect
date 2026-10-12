@@ -84,10 +84,11 @@ def strip_managed_settings(settings: dict) -> tuple[dict, bool]:
 
     servers = settings.get("mcpServers")
     if isinstance(servers, dict):
-        entry = servers.get("cardinal")
-        if isinstance(entry, dict) and entry.get("cardinalManaged"):
-            servers.pop("cardinal", None)
-            changed = True
+        for name in ("cardinal", "cardinal-behavior"):
+            entry = servers.get(name)
+            if isinstance(entry, dict) and entry.get("cardinalManaged"):
+                servers.pop(name, None)
+                changed = True
         if not servers:
             settings.pop("mcpServers", None)
         else:

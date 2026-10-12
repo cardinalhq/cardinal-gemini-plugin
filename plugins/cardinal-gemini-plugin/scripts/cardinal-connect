@@ -3,7 +3,8 @@
 
 Runs Cardinal's device-code flow, mints ingest and MCP keys, verifies both
 endpoints, writes a managed Cardinal extension bundle under
-~/.gemini/extensions/cardinal/, and adds the OTLP `telemetry` block to
+~/.gemini/extensions/cardinal/ (GEMINI.md, the manifest with mcpServers
+merged, hooks, skills, agents), and adds the OTLP `telemetry` block to
 ~/.gemini/settings.json so Gemini's native exporter ships to Cardinal
 alongside the hook-emitted events.
 
@@ -64,17 +65,48 @@ PENDING_PATH = PATHS.pending_path
 HOOK_MARKER = "cardinal-gemini-plugin"
 # Gemini CLI reads hook `timeout` in MILLISECONDS and, on expiry, kills the
 # hook and drops its output (packages/core/src/hooks/hookRunner.ts). Hooks
-# do only local work synchronously (network runs in a detached child); the
-# bound covers SessionStart's one 1.5s limits fetch with headroom.
+# do only local work synchronously (network runs in a detached child, or
+# under a hard deadline: SessionStart's bootstrap + limits fetch + discovery,
+# AfterAgent's turn-end check and owner-input flush); 10 s covers them.
 HOOK_TIMEOUT_MS = 10000
-# AfterAgent is not registered: Gemini fires it once per main-agent turn,
-# not per subagent, so it has nothing to report.
-REGISTERED_EVENTS = (
-    "SessionStart", "BeforeAgent", "BeforeTool", "AfterModel", "AfterTool", "PreCompress", "SessionEnd",
+# The storyboard preview renders every scene in the user's Chromium
+# (storyboard_authoring.on_preview: PREVIEW_HOOK_TIMEOUT_S).
+PREVIEW_TIMEOUT_MS = 150000
+# Every Cardinal hook group: (event, matcher, role, timeout ms). A matcher
+# is a regex Gemini searches in the tool name ("" = every call). Gemini
+# dedupes an event's hooks by `name:command` (gemini-cli 0.50.0
+# getHookKey, chunk-W4YMYD53.js:324365, and HookPlanner.deduplicateHooks),
+# so a second group on the same event needs its own command: the role.
+#   BeforeTool       context stamping on Cardinal's storyboard tools
+#   BeforeTool       role checks-gate: denies activate_skill for the checks
+#                    skill while the Checks preview is off (matcher: the
+#                    built-in tool's exact name)
+#   AfterTool        telemetry, evidence, advisories, authoring (every call)
+#   AfterTool        role preview: the storyboard__preview render (slow)
+#   AfterAgent       the turn's end: flush and stage only, never a block
+HOOK_GROUPS = (
+    ("SessionStart", "", "", HOOK_TIMEOUT_MS),
+    ("BeforeAgent", "", "", HOOK_TIMEOUT_MS),
+    ("BeforeTool", "storyboard__(create|add_act|publish|find)$", "", HOOK_TIMEOUT_MS),
+    ("BeforeTool", "^activate_skill$", "checks-gate", HOOK_TIMEOUT_MS),
+    ("AfterModel", "", "", HOOK_TIMEOUT_MS),
+    ("AfterTool", "", "", HOOK_TIMEOUT_MS),
+    ("AfterTool", "storyboard__preview$", "preview", PREVIEW_TIMEOUT_MS),
+    ("AfterAgent", "", "", HOOK_TIMEOUT_MS),
+    ("PreCompress", "", "", HOOK_TIMEOUT_MS),
+    ("SessionEnd", "", "", HOOK_TIMEOUT_MS),
 )
-# Matchers (a regex Gemini searches in the tool name); "" for the rest.
-# BeforeTool runs only for Cardinal's storyboard tools (context stamping).
-EVENT_MATCHERS = {"BeforeTool": "storyboard__(create|add_act|publish|find)$"}
+REGISTERED_EVENTS = tuple(dict.fromkeys(event for event, _, _, _ in HOOK_GROUPS))
+# Written into the installed extension's SKILL.md files: the plugin's
+# absolute root, so a skill names this plugin's scripts/ wherever Gemini runs.
+PLUGIN_ROOT_PLACEHOLDER = "__CARDINAL_PLUGIN_ROOT__"
+
+
+def hook_command(script: str, event: str, role: str = "") -> str:
+    """The command of one Cardinal hook handler (the marker lets
+    cardinal-disconnect and the repair find it)."""
+    role_arg = f" --role {shlex.quote(role)}" if role else ""
+    return f"python3 {script} --event {shlex.quote(event)}{role_arg} # {HOOK_MARKER}"
 
 
 def _is_cardinal_group(group: object) -> bool:
@@ -112,18 +144,15 @@ def set_cardinal_hook_entries(hooks_root: object) -> dict:
             root[event] = kept
         else:
             root.pop(event)
-    for event in REGISTERED_EVENTS:
+    for event, matcher, role, timeout in HOOK_GROUPS:
         groups = root.get(event) if isinstance(root.get(event), list) else []
         groups.append({
-            "matcher": EVENT_MATCHERS.get(event, ""),
+            "matcher": matcher,
             "cardinalManaged": True,
             "hooks": [{
                 "type": "command",
-                "command": (
-                    f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
-                    f"--event {shlex.quote(event)} # {HOOK_MARKER}"
-                ),
-                "timeout": HOOK_TIMEOUT_MS,
+                "command": hook_command(shlex.quote(str(HOOK_SCRIPT)), event, role),
+                "timeout": timeout,
             }],
         })
         root[event] = groups
@@ -147,33 +176,42 @@ def repair_hook_registration() -> list[str]:
     credentials. Installs from plugin versions before 0.17 wrote a
     hooks.json that Gemini CLI rejects (no top-level `hooks` key) and
     seconds-style timeouts (5 = 5ms); re-running cardinal-connect fixes
-    both. Returns the paths rewritten."""
+    both. A Cardinal-managed extension is rebuilt from this plugin (hooks,
+    skills, agents, GEMINI.md, the manifest with its mcpServers kept, plus
+    `cardinal-behavior` next to a concrete `cardinal`) when any of it
+    differs, so an upgraded plugin's skills, hooks and MCP servers reach
+    Gemini; without the extension, settings.json gets the same hooks and
+    `cardinal-behavior` entry. Returns the paths rewritten."""
     repaired: list[str] = []
-    manifest = EXTENSION_INSTALL_DIR / "gemini-extension.json"
-    if manifest.exists():
-        try:
-            ours = bool(json.loads(manifest.read_text()).get("cardinalManaged"))
-        except (OSError, ValueError, AttributeError):
-            ours = False
-        hooks_file = EXTENSION_INSTALL_DIR / "hooks" / "hooks.json"
-        try:
-            current = hooks_file.read_text()
-        except OSError:
-            current = None
-        if ours and current != render_extension_hooks():
-            write_extension_hooks(EXTENSION_INSTALL_DIR)
-            repaired.append(str(hooks_file))
+    manifest = read_manifest(EXTENSION_INSTALL_DIR)
+    if manifest is not None and manifest.get("cardinalManaged"):
+        url, key = cardinal_server(manifest)
+        if refresh_extension_bundle(url, key):
+            repaired.append(str(EXTENSION_INSTALL_DIR))
     if SETTINGS_PATH.exists():
         settings = load_json_object(SETTINGS_PATH, "settings.json")
+        changed = False
         hooks_root = settings.get("hooks")
         signature = _cardinal_signature(hooks_root)
         if signature:
             updated = set_cardinal_hook_entries(hooks_root)
             if _cardinal_signature(updated) != signature:
-                backup(SETTINGS_PATH)
                 settings["hooks"] = updated
-                atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
-                repaired.append(str(SETTINGS_PATH))
+                changed = True
+        # A --no-extension connection made before the Checks preview: its
+        # managed `cardinal` server has no `cardinal-behavior` next to it.
+        servers = settings.get("mcpServers")
+        cardinal = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+        if isinstance(cardinal, dict) and cardinal.get("cardinalManaged"):
+            current = servers.get(BEHAVIOR_SERVER_NAME)
+            wanted = {**behavior_server(), "cardinalManaged": True}
+            if (not isinstance(current, dict) or current.get("cardinalManaged")) and current != wanted:
+                servers[BEHAVIOR_SERVER_NAME] = wanted
+                changed = True
+        if changed:
+            backup(SETTINGS_PATH)
+            atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+            repaired.append(str(SETTINGS_PATH))
     return repaired
 
 
@@ -211,40 +249,213 @@ def load_json_object(path: Path, label: str) -> dict:
 # Extension bundle install
 # ---------------------------------------------------------------------------
 
-def install_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> None:
-    """Copy the plugin's extension/ into ~/.gemini/extensions/cardinal/.
+SKILLS_SOURCE = PLUGIN_ROOT / "skills"
+AGENTS_SOURCE = PLUGIN_ROOT / "agents"
+_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store")
 
-    The gemini-extension.json manifest is materialized with concrete
-    mcpServers values (no `${VAR}` placeholders — Gemini's manifest
-    variable-substitution semantics are unstable across releases).
-    hooks/hooks.json's `__HOOK_SCRIPT__` placeholder is replaced with the
-    absolute path to this plugin's telemetry hook.
-    """
-    if EXTENSION_INSTALL_DIR.exists():
-        shutil.rmtree(EXTENSION_INSTALL_DIR)
-    EXTENSION_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # GEMINI.md — copy verbatim.
-    shutil.copy(EXTENSION_SOURCE / "GEMINI.md", EXTENSION_INSTALL_DIR / "GEMINI.md")
+def read_manifest(ext_dir: Path) -> dict | None:
+    """The extension's gemini-extension.json as an object, else None."""
+    try:
+        data = json.loads((ext_dir / "gemini-extension.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
-    # gemini-extension.json — materialize concrete mcpServers when present.
-    manifest = json.loads((EXTENSION_SOURCE / "gemini-extension.json").read_text())
+
+def cardinal_server(manifest: dict | None) -> tuple:
+    """(url, key) of the manifest's concrete mcpServers.cardinal, else
+    (None, None) (absent, or still a `${VAR}` placeholder)."""
+    servers = manifest.get("mcpServers") if isinstance(manifest, dict) else None
+    entry = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return None, None
+    url = entry.get("url")
+    headers = entry.get("headers")
+    key = headers.get("X-CardinalHQ-API-Key") if isinstance(headers, dict) else None
+    if not (isinstance(url, str) and url and "${" not in url
+            and isinstance(key, str) and key and "${" not in key):
+        return None, None
+    return url, key
+
+
+# The local cardinal-behavior MCP server (Checks preview, behavior tools): a
+# stdio server Gemini CLI runs outside its sandbox, with --runtime gemini (its
+# connection is ~/.gemini/cardinal.json + cardinal-secrets.json; no key here).
+BEHAVIOR_SERVER_NAME = "cardinal-behavior"
+BEHAVIOR_SCRIPT = PLUGIN_ROOT / "scripts" / "cardinal-behavior"
+MANAGED_SERVERS = (MCP_SERVER_NAME, BEHAVIOR_SERVER_NAME)
+
+
+def behavior_server() -> dict:
+    return {"command": "python3", "args": [str(BEHAVIOR_SCRIPT), "--runtime", "gemini"]}
+
+
+def merged_mcp_servers(installed: object, mcp_url: str | None, mcp_key: str | None) -> dict:
+    """mcpServers for the installed manifest: every server already installed
+    (a user's, or one a later Cardinal feature added) and every server this
+    plugin's source manifest ships, MERGED, never replaced; then Cardinal's
+    own entries: `cardinal` with concrete values (no `${VAR}` placeholders —
+    Gemini's manifest variable substitution is unstable across releases) and
+    `cardinal-behavior`, or neither when there is no MCP credential."""
+    source = json.loads((EXTENSION_SOURCE / "gemini-extension.json").read_text()).get("mcpServers")
+    servers: dict = {}
+    for group in (installed, source):
+        if isinstance(group, dict):
+            servers.update({k: v for k, v in group.items() if k not in MANAGED_SERVERS})
     if mcp_url and mcp_key:
-        manifest["mcpServers"] = {
-            MCP_SERVER_NAME: {
-                "url": mcp_url,
-                "headers": {"X-CardinalHQ-API-Key": mcp_key},
-            }
-        }
+        servers[MCP_SERVER_NAME] = {"url": mcp_url, "headers": {"X-CardinalHQ-API-Key": mcp_key}}
+        servers[BEHAVIOR_SERVER_NAME] = behavior_server()
+    return servers
+
+
+def copy_skills(target: Path) -> None:
+    """skills/ into the extension (Gemini 0.50 loads <ext>/skills/*/SKILL.md,
+    ExtensionManager.loadExtension), with each Markdown file's
+    __CARDINAL_PLUGIN_ROOT__ replaced by this plugin's absolute root."""
+    if not SKILLS_SOURCE.is_dir():
+        return
+    dest = target / "skills"
+    shutil.copytree(SKILLS_SOURCE, dest, ignore=_COPY_IGNORE)
+    for md in dest.rglob("*.md"):
+        text = md.read_text(encoding="utf-8")
+        if PLUGIN_ROOT_PLACEHOLDER in text:
+            md.write_text(text.replace(PLUGIN_ROOT_PLACEHOLDER, str(PLUGIN_ROOT)), encoding="utf-8")
+
+
+def copy_agents(target: Path) -> None:
+    """agents/*.md into the extension (Gemini 0.50 loads <ext>/agents/*.md
+    as local subagents, loadAgentsFromDirectory)."""
+    if AGENTS_SOURCE.is_dir():
+        shutil.copytree(AGENTS_SOURCE, target / "agents", ignore=_COPY_IGNORE)
+
+
+def build_extension_bundle(target: Path, mcp_url: str | None, mcp_key: str | None,
+                           installed_servers: object = None) -> None:
+    """Write the whole extension into `target` (a new directory)."""
+    target.mkdir(parents=True)
+    shutil.copy(EXTENSION_SOURCE / "GEMINI.md", target / "GEMINI.md")
+    manifest = json.loads((EXTENSION_SOURCE / "gemini-extension.json").read_text())
+    servers = merged_mcp_servers(installed_servers, mcp_url, mcp_key)
+    if servers:
+        manifest["mcpServers"] = servers
     else:
         manifest.pop("mcpServers", None)
     manifest["cardinalManaged"] = True
-    (EXTENSION_INSTALL_DIR / "gemini-extension.json").write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
+    (target / "gemini-extension.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    write_extension_hooks(target)
+    copy_skills(target)
+    install_checks_skill(target)
+    copy_agents(target)
 
-    # hooks/hooks.json — patch __HOOK_SCRIPT__ placeholder.
-    write_extension_hooks(EXTENSION_INSTALL_DIR)
+
+def install_checks_skill(target: Path) -> None:
+    """The Checks preview's skill, when `cardinal-checks on` (a rebuilt
+    extension keeps it; SessionStart reconciles it otherwise)."""
+    try:
+        from cardinal_core import checks_install
+        if checks_install.is_enabled("gemini"):
+            checks_install.install(PLUGIN_ROOT, target / "skills" / checks_install.SKILL_DIR)
+    except (OSError, ValueError):
+        pass
+
+
+def _tree(root: Path) -> dict:
+    if not root.is_dir():
+        return {}
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+# The extension is built OUTSIDE ~/.gemini/extensions/: Gemini CLI loads
+# every subdirectory there as an extension, and a staging copy (same name
+# "cardinal") makes it throw on the duplicate. ~/.gemini/cardinal/ is on the
+# same filesystem, so the finished copy is renamed into place.
+STAGING_PARENT = PATHS.runtime_dir
+STAGING_PREFIX = ".extension-staging-"
+OLD_STAGING_GLOB = f".{EXTENSION_NAME}.staging-*"   # before: inside extensions/
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True   # exists, another user's
+    return True
+
+
+def _clean_stale_staging() -> None:
+    """Remove what an interrupted connect left: old-style staging copies in
+    ~/.gemini/extensions/ (which Gemini CLI loads as duplicate extensions),
+    and staging copies under ~/.gemini/cardinal/ whose process is gone."""
+    try:
+        for p in EXTENSIONS_DIR.glob(OLD_STAGING_GLOB):
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+    try:
+        for p in STAGING_PARENT.glob(STAGING_PREFIX + "*"):
+            suffix = p.name[len(STAGING_PREFIX):]
+            if suffix.isdigit() and int(suffix) != os.getpid() and _pid_alive(int(suffix)):
+                continue
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _staging_dir() -> Path:
+    _clean_stale_staging()
+    STAGING_PARENT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging = STAGING_PARENT / f"{STAGING_PREFIX}{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+def _swap_in(staging: Path) -> None:
+    if EXTENSION_INSTALL_DIR.exists():
+        shutil.rmtree(EXTENSION_INSTALL_DIR)
+    # A rename (same filesystem); shutil.move copies if ~/.gemini/cardinal
+    # was linked elsewhere.
+    shutil.move(str(staging), str(EXTENSION_INSTALL_DIR))
+
+
+def install_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> None:
+    """Install this plugin's extension as ~/.gemini/extensions/cardinal/:
+    GEMINI.md, the manifest (mcpServers merged: merged_mcp_servers),
+    hooks/hooks.json (`__HOOK_SCRIPT__` replaced with the absolute path to
+    this plugin's telemetry hook), skills/ and agents/. Built under
+    ~/.gemini/cardinal/ (never inside extensions/, which Gemini CLI loads
+    whole), then renamed into place."""
+    staging = _staging_dir()
+    try:
+        build_extension_bundle(staging, mcp_url, mcp_key,
+                               (read_manifest(EXTENSION_INSTALL_DIR) or {}).get("mcpServers"))
+        _swap_in(staging)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def refresh_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> bool:
+    """Rebuild the installed extension from this plugin when anything in it
+    differs (credentials unchanged: the caller passes the installed ones).
+    Whether it was rewritten."""
+    staging = _staging_dir()
+    try:
+        build_extension_bundle(staging, mcp_url, mcp_key,
+                               (read_manifest(EXTENSION_INSTALL_DIR) or {}).get("mcpServers"))
+        if _tree(staging) == _tree(EXTENSION_INSTALL_DIR):
+            return False
+        _swap_in(staging)
+        return True
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +506,9 @@ def apply_settings(ingest: dict | None, mcp_url: str | None, mcp_key: str | None
                 "headers": {"X-CardinalHQ-API-Key": mcp_key},
                 "cardinalManaged": True,
             }
+            current = servers.get(BEHAVIOR_SERVER_NAME)
+            if not isinstance(current, dict) or current.get("cardinalManaged"):
+                servers[BEHAVIOR_SERVER_NAME] = {**behavior_server(), "cardinalManaged": True}
             settings["mcpServers"] = servers
 
         settings["hooks"] = set_cardinal_hook_entries(settings.get("hooks"))
@@ -577,10 +791,10 @@ def main() -> int:
         # registration in place (fixes installs from older plugin versions).
         repaired = repair_hook_registration()
         if repaired:
-            print("Refreshed Cardinal hook registration (credentials unchanged):")
+            print("Refreshed the Cardinal extension / hook registration (credentials unchanged):")
             for path in repaired:
                 print(f"  {path}")
-            print(f"Cardinal is already connected as {user}. Restart Gemini CLI so it reloads hooks.")
+            print(f"Cardinal is already connected as {user}. Restart Gemini CLI so it reloads hooks and skills.")
             return 0
         sys.stderr.write(
             f"Cardinal is already connected as {user}. "
