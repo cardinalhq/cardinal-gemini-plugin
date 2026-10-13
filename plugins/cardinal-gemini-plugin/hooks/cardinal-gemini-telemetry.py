@@ -588,26 +588,12 @@ def staged_for_prompt(session_id: str) -> str | None:
         return None
 
 
-def record_sandbox_turn(session_id: str) -> None:
-    """Whether this turn ran inside Gemini CLI's seatbelt sandbox
-    (SANDBOX=sandbox-exec), counted in the session's Cardinal state
-    (investigation_events.record_sandbox_turn): cardinal-wake requires every
-    recorded turn sandboxed before it would resume the session. Local only,
-    fails open; the record is agent-writable, a hint, never the boundary."""
-    try:
-        from cardinal_core import investigation_events as ie
-        ie.record_sandbox_turn(Path.home(), session_id)
-    except Exception:
-        pass
-
-
 def handle_before_agent(payload: dict[str, Any]) -> None:
     dump_debug_payload("BeforeAgent", payload)
     session_id = session_id_from_payload(payload)
     if not session_id:
         return
     cwd = str(payload.get("cwd") or os.getcwd())
-    record_sandbox_turn(session_id)
 
     # Sync half: local files only. The gate verdict, the prompt's context
     # and the disclosure share one stdout JSON object (Gemini parses a
