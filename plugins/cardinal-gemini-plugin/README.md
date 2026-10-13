@@ -367,89 +367,61 @@ python3 scripts/cardinal-status
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
 python3 scripts/cardinal-checks on|off|status
-python3 scripts/cardinal-wake enable|disable|status|run --dry-run
+python3 scripts/cardinal-wake enable|disable|status|run --dry-run|resume <session>
 ```
 
-## Owner-woken sessions (notify-only for now)
+## Owner-woken sessions
 
-`python3 scripts/cardinal-wake enable` (macOS; a per-user launchd agent)
-watches for owner decisions you post on an Investigation page addressed to
-a stopped session on this machine. Only a decision posted from your
-signed-in Cardinal web session counts. The waker reads it from Cardinal
-with this plugin's key, never from local files. It recognizes a Gemini CLI
-session by its chat file (`~/.gemini/tmp/*/chats/session-*-<first 8 of the
-id>.json[l]` naming the session id). `disable` removes the agent;
-`status` shows recent wakes and approved roots, never decision text.
+`python3 scripts/cardinal-wake` (macOS; a per-user launchd agent) tells you
+about owner decisions you post on an Investigation page addressed to a
+session on this machine, and resumes a stopped one in your own terminal
+when you ask.
 
-**Today a Gemini CLI session always gets a notification**, naming the
-session, the Investigation and the state, and is never resumed. An
-unattended Gemini launch is built but ships off (`GEMINI_LAUNCH_PROVEN`
-in `cardinal_core.session_wake`) until its live proofs pass
-([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md)
-§5.3 Gemini, §6 C-9 to C-16). When it is on, a decision resumes the
-session only if:
+```bash
+python3 scripts/cardinal-wake enable                     # install the per-user launchd agent (macOS)
+python3 scripts/cardinal-wake status                     # the setting, recent notifications, resume commands
+python3 scripts/cardinal-wake run --dry-run              # what the next pass would do; notifies nothing
+python3 scripts/cardinal-wake resume <session>           # resume it here (a unique 8+ hex prefix is enough)
+python3 scripts/cardinal-wake resume <session> --print   # show the command and its directory only
+python3 scripts/cardinal-wake disable                    # remove the launchd agent
+```
 
-- you approved its directory: `cardinal-wake enable --launch --root PATH`
-  (repeatable; never your home directory or above it). The session's
-  directory, from Gemini's own project record, must be inside an approved
-  root and be a git work tree;
-- every turn of the session ran inside Gemini's sandbox (`gemini -s`);
-- you sign in with a Gemini API key, in `~/.gemini/.env`
-  (`GEMINI_API_KEY=…`). The sandbox can read neither the macOS keychain nor
-  any `.env` file, so the waker passes the key to the woken process in its
-  environment; it never logs or stores it. "Sign in with Google" is
-  notify-only, because the sandbox can't read the OAuth credentials;
-- nothing in the repository or your settings changes the sandbox. That
-  rules out any of:
-  - a custom `.gemini/sandbox-macos-*.sb`, `sandbox.Dockerfile` or
-    `sandbox.bashrc`;
-  - a `.gemini/settings.json` with `tools.sandbox*`, `security.*`,
-    `context.includeDirectories`, MCP servers, hooks or tool-discovery
-    commands;
-  - any `.env` that Gemini may load setting `SANDBOX`, `GEMINI_SANDBOX*`,
-    `SEATBELT_*`, `GEMINI_CLI_HOME`, proxy, `NODE_OPTIONS` or `DEBUG`
-    variables;
-  - a symlinked or unreadable `.gemini`;
-- no other Gemini wake is running and port 8877 is free.
+**What reaches you.** Only an owner decision you post from your signed-in
+Cardinal web session, addressed to a session on this machine, counts; never
+anything an agent posts. The waker reads it straight from Cardinal with the
+Cardinal key of the plugin whose session it is (this plugin's: `~/.gemini/cardinal.json` `mcp_url` + `cardinal-secrets.json`
+`mcp_api_key`), never from
+local files. Each decision is one macOS notification naming the runtime,
+the session (first 8 characters of its id) and the Investigation (its id and
+host), never the decision's text; at most 3 per session and 10 in all per
+rolling day (the rest follow later). A decision posted without "Resume this
+session if it has stopped", or older than 7 days, is notified the same way.
 
-It then starts the waker's allow-list proxy, which runs
-`sandbox-exec -f <the waker's copy of Gemini's restrictive-proxied profile>
-gemini --resume <id> --approval-mode yolo --skip-trust -p "<wake prompt>"`:
-- **Sandbox, from the first instruction:** the waker applies the seatbelt
-  itself, around the whole Gemini process. The agent can write only the
-  workspace, its own temp dir (under `~/.cardinal/wake/tmp/`, with a
-  private cache inside it, both removed after the run), and
-  `~/.cache/cardinal/sandboxed` (this plugin's hook state). The waker's copy
-  of the profile drops Gemini's `~/.npm` and `~/.cache` writes, and passes
-  the private cache instead of your shared user cache directory: npm and
-  other tools later read those outside any sandbox.
-  - Gemini's own `-s` is not passed: a seatbelt can't be nested. Instead
-    `SANDBOX=sandbox-exec` is set, which tells Gemini it is already
-    sandboxed (and tells this plugin's hooks where to keep their state).
-- **Network:** the profile allows only `localhost:8877`. The proxy
-  (`allowlist_proxy.py`, copied into `~/.cardinal/wake/lib`) owns that port
-  exclusively before Gemini starts. It tunnels HTTPS to the Gemini API and
-  your Cardinal hosts and refuses everything else. Each verdict goes to the
-  wake's log. Gemini CLI's own OTLP exporter (above) reaches the ingest host
-  through it but has no key there: the profile denies reading `.env` files,
-  where `cardinal-connect` keeps the exporter's header.
-- **Acknowledgment:** as for Codex, the wake prompt asks the agent to write
-  its answer to `$TMPDIR/cardinal-wake-ack.json` (its private temp dir);
-  after the run has exited the waker checks it and posts that one
-  acknowledgment for the session, unless the session already acknowledged
-  the decision itself.
-- **Runtime check:** within 20 s the waker must also see `sandbox-exec` with
-  that profile in the process tree. If it doesn't, it kills the process tree
-  and turns Gemini launch off until you run `cardinal-wake reenable gemini`.
-  A process that has already exited is judged after the run instead.
-- **Yolo:** it acts inside the sandbox. The sandbox and the proxy are the
-  boundary.
-- **The daemon:** like the Codex launch, it runs with a vetted Python
-  (`-I`), a vetted `gemini` (and `node`), and a system-only PATH, all
-  checked again before every launch.
+**The notification.** For a session whose window is still open it says to
+switch to that window. For a stopped session it ends with
+`Resume: ~/.cardinal/wake/lib/cardinal-wake resume <first 8 of the id>`:
+run that in your terminal, or install
+[terminal-notifier](https://github.com/julienXX/terminal-notifier)
+(`brew install terminal-notifier`) and click the notification: Terminal
+opens and runs it (through a private `~/.cardinal/wake/resume/<id>.command`).
 
-**State inside the sandbox.** Gemini's sandbox also wraps this plugin's
-hooks, and they cannot write `~/.cardinal` (nor `~/.gemini`) there.
+**`resume`.** The waker recognizes a Gemini CLI session by its chat file
+(`~/.gemini/tmp/*/chats/session-*-<first 8 of the id>.json[l]` naming the
+session id). `resume` takes its working directory only from Gemini's own
+project record for that chat (`~/.gemini/tmp/<project>/.project_root`),
+never from the Investigation binding, refuses if it is gone, and runs there
+`gemini --resume <session> "<wake prompt>"` (interactive, with your own
+settings and sandbox choice). gemini-cli documents resuming by the full
+session UUID ("Resume by ID").
+The wake prompt names the decision's number and Investigation (never its
+text) and is listed as a machine prompt, so the resumed turn is never
+recorded as owner input. The resumed session also receives the decision
+through this plugin's investigation hooks, as any session does.
+`resume --print` shows the command and its directory without running them;
+`status` lists candidate sessions with their resume commands.
+
+**State inside the sandbox.** Gemini's sandbox (`gemini -s`) also wraps this
+plugin's hooks, and they cannot write `~/.cardinal` (nor `~/.gemini`) there.
 Inside it (`SANDBOX=sandbox-exec`), the hooks keep their Investigation
 state and their evidence spool under
 `~/.cache/cardinal/sandboxed/.cardinal`. That is a separate spool, written
@@ -457,11 +429,25 @@ by the sandboxed agent's own process: evidence captured there is what that
 (agent-writable) spool recorded, and `cardinal-evidence` run outside the
 sandbox reads `~/.cardinal/evidence`, not this spool. Telemetry and
 decision state under `~/.gemini/cardinal` cannot be written inside the
-sandbox and are skipped there. The prompt hook also records whether each
-turn ran sandboxed. That record is agent-writable too, so it is a weaker
-assurance than the rollout Codex keeps. What bounds a Gemini wake is the
-approved roots, the proxy and the runtime sandbox check. The waker's own
-state (`~/.cardinal/wake`) is never written by hooks.
+sandbox and are skipped there. The waker reads those relocated bindings as
+hints only (a decision still has to come from Cardinal), and its own state
+(`~/.cardinal/wake`) is never written by hooks.
+
+**Nothing is ever started unattended.** The waker only notifies; you resume,
+in your own terminal, with your own settings and permissions, and you see
+everything the session does ([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md) v4). `enable --launch`, from earlier
+versions, is refused with a one-line message. `enable` copies this plugin's
+`cardinal_core` and a small runner into `~/.cardinal/wake/lib/` (every enable
+copies them again, so a plugin upgrade never leaves the agent pointing at a
+removed version) and runs it every 45 s with a Python that resolves outside
+your home directory, your repositories, temp dirs and version-manager shims,
+in isolated mode (`-I -S`), with a system-only PATH. `disable` removes the
+launchd agent.
+
+After updating the plugin, run `cardinal-wake enable` again: it refreshes the
+stable copy in `~/.cardinal/wake/lib/` (until then `status` says the
+installed runner is out of date, and notifications ask for it instead of
+naming the resume command).
 
 ## Requirements
 
