@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -25,6 +26,69 @@ HOOK_MARKER = "cardinal-gemini-plugin"
 MIN_HOOK_TIMEOUT_MS = 1000
 # Hooks are on by default from Gemini CLI 0.26.0 (hooksConfig.enabled).
 MIN_GEMINI_VERSION = (0, 26, 0)
+ENV_PATH = GEMINI_DIR / ".env"
+HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
+REPAIR_HINT = "Run cardinal-connect --repair, then restart Gemini CLI."
+
+
+def settings_validity_problems(settings: dict) -> list[str]:
+    """What in settings.json Gemini CLI rejects that a Cardinal plugin
+    version wrote: the legacy telemetry block (target "otlp" is fatal:
+    Gemini CLI refuses to start) and `cardinalManaged` keys on mcpServers
+    entries (strictly validated: reported on every start)."""
+    problems = []
+    tel = settings.get("telemetry")
+    if isinstance(tel, dict):
+        if tel.get("target") not in (None, "local", "gcp"):
+            problems.append(f"{SETTINGS_PATH} sets telemetry.target to {tel.get('target')!r}; "
+                            "Gemini CLI refuses to start (valid: local, gcp).")
+        bad = sorted(k for k in ("otlpHeaders", "cardinalManaged") if k in tel)
+        if bad:
+            problems.append(f"{SETTINGS_PATH} telemetry has keys Gemini CLI rejects: {', '.join(bad)}"
+                            + (" (otlpHeaders holds an API key in plain text)" if "otlpHeaders" in bad else "")
+                            + ".")
+    servers = settings.get("mcpServers")
+    if isinstance(servers, dict):
+        tagged = sorted(n for n, e in servers.items() if isinstance(e, dict) and "cardinalManaged" in e)
+        if tagged:
+            problems.append(f"{SETTINGS_PATH} mcpServers {', '.join(tagged)} carry `cardinalManaged`, "
+                            "which Gemini CLI rejects.")
+    return problems
+
+
+def env_file_gemini_loads(cwd: Path, home: Path) -> Path | None:
+    """The one .env Gemini CLI loads when started in `cwd` from a trusted
+    folder (cli config/settings findEnvFile): walking up, <dir>/.gemini/.env
+    then <dir>/.env; past the root, ~/.gemini/.env then ~/.env."""
+    d = cwd.resolve()
+    while True:
+        for candidate in (d / ".gemini" / ".env", d / ".env"):
+            if candidate.is_file():
+                return candidate
+        if d.parent == d:
+            break
+        d = d.parent
+    for candidate in (home / ".gemini" / ".env", home / ".env"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def native_telemetry_warnings(cwd: Path) -> list[str]:
+    """Where Gemini CLI's exporter would send without Cardinal's key header."""
+    warnings = []
+    for name in (HEADERS_ENV, "OTEL_EXPORTER_OTLP_ENDPOINT", "GEMINI_TELEMETRY_OTLP_ENDPOINT",
+                 "GEMINI_TELEMETRY_TARGET"):
+        if os.environ.get(name):
+            warnings.append(f"{name} is set in this shell; it overrides Cardinal's "
+                            f"{'header in ' + str(ENV_PATH) if name == HEADERS_ENV else 'settings.json value'}.")
+    loaded = env_file_gemini_loads(cwd, Path.home())
+    if loaded is not None and loaded.resolve() != ENV_PATH.resolve():
+        warnings.append(f"Started in {cwd}, Gemini CLI loads {loaded} instead of {ENV_PATH}, so its "
+                        "exporter sends without Cardinal's API key there (ingest answers 401). "
+                        "Cardinal's hooks are unaffected.")
+    warnings.append("In folders Gemini CLI does not trust, it skips ~/.gemini/.env: same effect.")
+    return warnings
 
 
 def _cardinal_handlers(event_map: object):
@@ -165,6 +229,8 @@ def probe_ingest(endpoint: str, api_key: str, api_header: str) -> str:
 def main() -> int:
     if not STATE_PATH.exists():
         print("Not connected. Run cardinal-connect to configure Cardinal for Gemini CLI.")
+        for problem in settings_validity_problems(load_json(SETTINGS_PATH, "settings.json")):
+            print(f"FAIL {problem} {REPAIR_HINT}")
         return 1
 
     state = load_json(STATE_PATH, "cardinal.json")
@@ -202,6 +268,14 @@ def main() -> int:
     else:
         telemetry_line = "disabled"
     print(f"Telemetry:       {telemetry_line}")
+    native = state.get("native_telemetry") if isinstance(state.get("native_telemetry"), dict) else {}
+    if native.get("enabled"):
+        print(f"Gemini exporter: on (OTLP/http; API key header from {ENV_PATH})")
+    elif native.get("requested"):
+        print("Gemini exporter: requested but not written (see cardinal-connect output)")
+    else:
+        print("Gemini exporter: off (Cardinal's hooks send Cardinal's events; "
+              "cardinal-connect --native-telemetry turns it on)")
     print(f"Ingest endpoint: {state.get('ingest_endpoint')}")
     print(f"Ingest key pref: {state.get('ingest_key_prefix')}")
     print(f"Settings path:   {SETTINGS_PATH}")
@@ -244,6 +318,13 @@ def main() -> int:
                 print(msg)
                 if msg.startswith("FAIL"):
                     failures += 1
+
+    for problem in settings_validity_problems(settings):
+        print(f"FAIL {problem} {REPAIR_HINT}")
+        failures += 1
+    if native.get("enabled"):
+        for warning in native_telemetry_warnings(Path.cwd()):
+            print(f"WARN {warning}")
 
     for problem in hook_registration_problems(settings):
         print(f"FAIL {problem} Re-run cardinal-connect to rewrite it, then restart Gemini CLI.")

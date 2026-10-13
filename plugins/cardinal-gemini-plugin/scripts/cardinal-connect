@@ -2,11 +2,19 @@
 """Connect Gemini CLI to Cardinal telemetry and MCP.
 
 Runs Cardinal's device-code flow, mints ingest and MCP keys, verifies both
-endpoints, writes a managed Cardinal extension bundle under
+endpoints, and writes a managed Cardinal extension bundle under
 ~/.gemini/extensions/cardinal/ (GEMINI.md, the manifest with mcpServers
-merged, hooks, skills, agents), and adds the OTLP `telemetry` block to
-~/.gemini/settings.json so Gemini's native exporter ships to Cardinal
-alongside the hook-emitted events.
+merged, hooks, skills, agents). Cardinal's hooks send Cardinal's events.
+
+Gemini CLI's own OTLP exporter is opt-in (--native-telemetry): it adds a
+schema-valid `telemetry` block to ~/.gemini/settings.json and the ingest
+key header to ~/.gemini/.env (Gemini reads OTLP headers only from
+OTEL_EXPORTER_OTLP_HEADERS). settings.json never carries a key, and no
+Cardinal marker: Gemini validates `telemetry` and `mcpServers` entries
+strictly, so what Cardinal wrote is recorded in ~/.gemini/cardinal.json
+(`settings_owned`). A re-run (or --repair) rewrites the invalid
+`telemetry` block plugin 0.22.1 and earlier wrote (target "otlp",
+otlpHeaders, cardinalManaged), which stops Gemini CLI from starting.
 
 Monorepo adapter: the device-code flow, endpoint reachability probes, and
 atomic file writers come from the vendored `cardinal_core` package. This
@@ -19,10 +27,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -146,9 +156,10 @@ def set_cardinal_hook_entries(hooks_root: object) -> dict:
             root.pop(event)
     for event, matcher, role, timeout in HOOK_GROUPS:
         groups = root.get(event) if isinstance(root.get(event), list) else []
+        # No `cardinalManaged` key: the command's HOOK_MARKER identifies
+        # Cardinal's groups (older groups carrying the key still match).
         groups.append({
             "matcher": matcher,
-            "cardinalManaged": True,
             "hooks": [{
                 "type": "command",
                 "command": hook_command(shlex.quote(str(HOOK_SCRIPT)), event, role),
@@ -190,6 +201,7 @@ def repair_hook_registration() -> list[str]:
             repaired.append(str(EXTENSION_INSTALL_DIR))
     if SETTINGS_PATH.exists():
         settings = load_json_object(SETTINGS_PATH, "settings.json")
+        before = json.loads(json.dumps(settings))
         changed = False
         hooks_root = settings.get("hooks")
         signature = _cardinal_signature(hooks_root)
@@ -200,18 +212,22 @@ def repair_hook_registration() -> list[str]:
                 changed = True
         # A --no-extension connection made before the Checks preview: its
         # managed `cardinal` server has no `cardinal-behavior` next to it.
+        owned = owned_servers_record(read_state())
         servers = settings.get("mcpServers")
         cardinal = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
-        if isinstance(cardinal, dict) and cardinal.get("cardinalManaged"):
+        if owns_server(MCP_SERVER_NAME, cardinal, owned):
             current = servers.get(BEHAVIOR_SERVER_NAME)
-            wanted = {**behavior_server(), "cardinalManaged": True}
-            if (not isinstance(current, dict) or current.get("cardinalManaged")) and current != wanted:
+            wanted = behavior_server()
+            if (not isinstance(current, dict) or owns_server(BEHAVIOR_SERVER_NAME, current, owned)) \
+                    and current != wanted:
                 servers[BEHAVIOR_SERVER_NAME] = wanted
                 changed = True
         if changed:
-            backup(SETTINGS_PATH)
-            atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
+            write_settings(before, settings)
             repaired.append(str(SETTINGS_PATH))
+            if isinstance(servers, dict) and servers.get(BEHAVIOR_SERVER_NAME) == behavior_server():
+                remember_owned_servers({BEHAVIOR_SERVER_NAME: server_fingerprint(
+                    BEHAVIOR_SERVER_NAME, servers[BEHAVIOR_SERVER_NAME])})
     return repaired
 
 
@@ -459,63 +475,385 @@ def refresh_extension_bundle(mcp_url: str | None, mcp_key: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# settings.json — telemetry + (fallback) mcpServers + hooks
+# settings.json — (opt-in) telemetry + (fallback) mcpServers + hooks
 # ---------------------------------------------------------------------------
+#
+# Gemini CLI validates ~/.gemini/settings.json against its settings schema
+# (gemini-cli 0.63.0 settingsSchema TelemetrySettings / MCPServerConfig,
+# settings-validation buildZodSchemaFromJsonSchema): `telemetry` and every
+# `mcpServers` entry reject unknown keys (additionalProperties: false), so a
+# `cardinalManaged` or `otlpHeaders` key is reported on every start; hook
+# groups are open objects. resolveTelemetrySettings (core telemetry/config)
+# throws a FatalConfigError for any `target` but "local" / "gcp", and Gemini
+# CLI refuses to start (0.26.0 through 0.63.0). Plugin 0.22.1 and earlier
+# wrote target "otlp" + otlpHeaders (the ingest key) + cardinalManaged.
+# Nothing Cardinal writes into settings.json carries a key or a marker:
+# ownership lives in cardinal.json `settings_owned`.
 
 _TELEMETRY_KEY = "telemetry"
+# TelemetrySettings properties (gemini-cli 0.63.0).
+TELEMETRY_KEYS = ("enabled", "target", "otlpEndpoint", "otlpProtocol", "traces",
+                  "logPrompts", "outfile", "useCollector", "useCliAuth")
+TELEMETRY_TARGETS = ("local", "gcp")
+# From 0.34.0 Gemini CLI appends v1/traces, v1/logs and v1/metrics to an
+# http otlpEndpoint (core telemetry/sdk buildUrl); before, every signal went
+# to the endpoint as written, so an older CLI is pointed at /v1/logs.
+OTLP_PATHS_APPENDED_FROM = (0, 34, 0)
+
+# Gemini CLI takes OTLP headers only from the environment (the OTel
+# exporters read OTEL_EXPORTER_OTLP_HEADERS; no settings key exists). It
+# loads ONE .env per start: walking up from the working directory,
+# <dir>/.gemini/.env (trusted folders only), then <dir>/.env; past the
+# filesystem root ~/.gemini/.env (trusted only), then ~/.env (cli
+# config/settings findEnvFile). An untrusted folder applies only auth
+# variables. A variable already in the environment wins.
+ENV_PATH = GEMINI_DIR / ".env"
+HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
+ENV_BLOCK_BEGIN = (f"# >>> {HOOK_MARKER}: Gemini CLI's OTLP exporter -> Cardinal ingest "
+                   "(cardinal-connect writes it, cardinal-disconnect removes it)")
+ENV_BLOCK_END = f"# <<< {HOOK_MARKER}"
+_ENV_BLOCK_PREFIX = f"# >>> {HOOK_MARKER}"
+
+
+def gemini_cli_version() -> tuple[int, int, int] | None:
+    """The installed Gemini CLI's version, from the package.json of the
+    `gemini` on PATH (file reads only). None when it cannot be found."""
+    exe = shutil.which("gemini")
+    if not exe:
+        return None
+    try:
+        d = Path(os.path.realpath(exe)).parent
+        for _ in range(6):
+            pkg = d / "package.json"
+            if pkg.is_file():
+                data = json.loads(pkg.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("name") == "@google/gemini-cli":
+                    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(data.get("version") or ""))
+                    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+            if d.parent == d:
+                break
+            d = d.parent
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def native_telemetry_block(ingest_endpoint: str, version: tuple | None = None) -> dict:
+    """The `telemetry` block for Gemini's own exporter: target "local" with an
+    otlpEndpoint exports in process over OTLP/http (`useOtlp`, core
+    telemetry/sdk initializeTelemetry). No key: headers come from the env."""
+    endpoint = str(ingest_endpoint).rstrip("/")
+    if version is not None and version < OTLP_PATHS_APPENDED_FROM:
+        endpoint += "/v1/logs"
+    return {
+        "enabled": True,
+        "target": "local",
+        "otlpEndpoint": endpoint,
+        "otlpProtocol": "http",
+        "logPrompts": False,
+    }
+
+
+def is_legacy_telemetry(block: object) -> bool:
+    """The invalid block plugin 0.22.1 and earlier wrote (or a copy of it)."""
+    return isinstance(block, dict) and (
+        bool(block.get("cardinalManaged")) or "otlpHeaders" in block or block.get("target") == "otlp"
+    )
+
+
+def sanitized_telemetry(block: dict) -> dict:
+    """A legacy-shaped block that is not Cardinal's, made valid: schema keys
+    only (otlpHeaders, which may hold a key, is dropped), target local/gcp."""
+    clean = {k: v for k, v in block.items() if k in TELEMETRY_KEYS}
+    if "target" in clean and clean["target"] not in TELEMETRY_TARGETS:
+        clean["target"] = "local"
+    if "otlpProtocol" in clean and clean["otlpProtocol"] not in ("grpc", "http"):
+        clean.pop("otlpProtocol")
+    return clean
+
+
+def read_state() -> dict:
+    try:
+        data = json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def settings_owned_record(state: dict) -> dict:
+    record = state.get("settings_owned")
+    return record if isinstance(record, dict) else {}
+
+
+def owned_servers_record(state: dict) -> dict:
+    servers = settings_owned_record(state).get("mcp_servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def server_fingerprint(name: str, entry: dict) -> dict:
+    """What identifies Cardinal's settings.json server entry (never its key)."""
+    if name == MCP_SERVER_NAME:
+        return {"url": entry.get("url")}
+    return {"command": entry.get("command"), "args": entry.get("args")}
+
+
+def owns_server(name: str, entry: object, owned: dict) -> bool:
+    """Whether a settings.json mcpServers entry is Cardinal's: recorded in
+    cardinal.json, or carrying the `cardinalManaged` key older versions wrote."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("cardinalManaged"):
+        return True
+    fingerprint = owned.get(name)
+    return isinstance(fingerprint, dict) and bool(fingerprint) and all(
+        entry.get(k) == v for k, v in fingerprint.items()
+    )
+
+
+def remember_owned_servers(update: dict) -> None:
+    """Merge server fingerprints into cardinal.json `settings_owned`."""
+    if not STATE_PATH.exists() or not update:
+        return
+    state = read_state()
+    record = dict(settings_owned_record(state))
+    record["mcp_servers"] = {**owned_servers_record(state), **update}
+    state["settings_owned"] = record
+    atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def strip_env_block(text: str) -> str:
+    """`text` without Cardinal's ~/.gemini/.env block."""
+    lines = text.splitlines(keepends=True)
+    if not any(line.startswith(_ENV_BLOCK_PREFIX) for line in lines):
+        return text
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        if not inside and line.startswith(_ENV_BLOCK_PREFIX):
+            inside = True
+            continue
+        if inside:
+            if line.strip() == ENV_BLOCK_END:
+                inside = False
+                continue
+            if line.startswith(f"{HEADERS_ENV}="):
+                continue
+            # An unterminated block ends at its own lines.
+            inside = False
+        out.append(line)
+    return "".join(out)
+
+
+def env_assigns(text: str, name: str) -> bool:
+    return bool(re.search(rf"^\s*(?:export\s+)?{re.escape(name)}\s*=", text, re.M))
+
+
+def read_env_file() -> str:
+    try:
+        return ENV_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def apply_env_headers(header: str | None, key: str | None) -> bool:
+    """Write Cardinal's block (the ingest key header for Gemini's exporter)
+    into ~/.gemini/.env when `header` and `key` are given, else remove it.
+    The file is 0600. Whether it changed."""
+    text = read_env_file()
+    new = strip_env_block(text)
+    if header and key:
+        if new and not new.endswith("\n"):
+            new += "\n"
+        value = f"{header}={urllib.parse.quote(key, safe='')}"
+        new += f"{ENV_BLOCK_BEGIN}\n{HEADERS_ENV}='{value}'\n{ENV_BLOCK_END}\n"
+    if new == text:
+        return False
+    if new.strip():
+        atomic_write_secret(ENV_PATH, new)
+    elif ENV_PATH.exists():
+        ENV_PATH.unlink()
+    return True
+
+
+def _redacted(settings: dict) -> dict:
+    """settings.json with legacy otlpHeaders values blanked (for backups)."""
+    tel = settings.get(_TELEMETRY_KEY)
+    if not (isinstance(tel, dict) and isinstance(tel.get("otlpHeaders"), dict)):
+        return settings
+    headers = {k: "<redacted by cardinal-connect>" for k in tel["otlpHeaders"]}
+    return {**settings, _TELEMETRY_KEY: {**tel, "otlpHeaders": headers}}
+
+
+def write_settings(before: dict, after: dict) -> Path | None:
+    """Back up settings.json (an ingest key in a legacy block blanked), then
+    write `after`. The backup path."""
+    backup_path = None
+    if SETTINGS_PATH.exists():
+        redacted = _redacted(before)
+        if redacted is before:
+            backup_path = backup(SETTINGS_PATH)
+        else:
+            backup_path = SETTINGS_PATH.with_name(
+                f"{SETTINGS_PATH.name}.bak.{time.strftime('%Y%m%d-%H%M%S')}")
+            atomic_write_secret(backup_path, json.dumps(redacted, indent=2) + "\n")
+    atomic_write(SETTINGS_PATH, json.dumps(after, indent=2) + "\n")
+    return backup_path
+
+
+def redact_legacy_backups() -> list[str]:
+    """settings.json.bak.* files earlier connects wrote hold the ingest key
+    in plain text (otlpHeaders); blank it. The paths rewritten."""
+    rewritten = []
+    for path in sorted(GEMINI_DIR.glob("settings.json.bak.*")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        clean = _redacted(data)
+        tel = data.get(_TELEMETRY_KEY)
+        if clean is not data and tel.get("otlpHeaders") != clean[_TELEMETRY_KEY]["otlpHeaders"]:
+            atomic_write_secret(path, json.dumps(clean, indent=2) + "\n")
+            rewritten.append(str(path))
+    return rewritten
 
 
 def apply_settings(ingest: dict | None, mcp_url: str | None, mcp_key: str | None,
-                   include_hooks: bool) -> Path | None:
-    """Merge Cardinal-managed keys into ~/.gemini/settings.json.
+                   include_hooks: bool, native: bool = False) -> dict:
+    """Bring ~/.gemini/settings.json (and ~/.gemini/.env) to what Cardinal
+    wants, touching only what Cardinal owns. Returns {changed: [paths],
+    backup, settings_owned, native_active, notes}.
 
-    Always writes (when the bundle carried an ingest credential):
-      - `telemetry` block pointing at Cardinal's OTLP ingest endpoint.
-    Without one (org has no Lakerunner / server has no ingest endpoint), a
-    Cardinal-managed `telemetry` block from a prior connect is removed so
-    Gemini stops exporting to it; a user-owned block is left alone.
+    `telemetry` (only with `native` and an ingest credential): the block for
+    Gemini's own OTLP exporter, plus Cardinal's ~/.gemini/.env block with
+    the key header. Otherwise a Cardinal-owned block (recorded in
+    cardinal.json, or the legacy `cardinalManaged` one) is removed and the
+    .env block with it. A user's block is never replaced; one in the
+    legacy shape (target "otlp" / otlpHeaders) is made valid, since Gemini
+    CLI does not start with it.
 
-    When `include_hooks=True` (no-extension install path only):
-      - `mcpServers.cardinal`
-      - `hooks.<Event>` entries tagged `cardinalManaged: true` per hook
-        handler so cardinal-disconnect can strip them precisely.
+    `mcpServers`: the `cardinalManaged` key older versions put on
+    Cardinal's entries is removed (Gemini rejects it). When
+    `include_hooks=True` (the no-extension install): `mcpServers.cardinal`
+    and `cardinal-behavior`, and the hook groups (set_cardinal_hook_entries).
     """
-    settings = load_json_object(SETTINGS_PATH, "settings.json")
+    before = load_json_object(SETTINGS_PATH, "settings.json")
+    settings = json.loads(json.dumps(before))
+    state = read_state()
+    prior = settings_owned_record(state)
+    prior_servers = owned_servers_record(state)
+    notes: list[str] = []
+    changed: list[str] = []
 
-    if ingest:
-        settings[_TELEMETRY_KEY] = {
-            "enabled": True,
-            "target": "otlp",
-            "otlpEndpoint": str(ingest["endpoint"]).rstrip("/") + "/v1/logs",
-            "otlpHeaders": {
-                (ingest.get("api_header") or "x-cardinalhq-api-key"): ingest["api_key"],
-            },
-            "logPrompts": False,
-            "cardinalManaged": True,
-        }
-    else:
-        existing = settings.get(_TELEMETRY_KEY)
-        if isinstance(existing, dict) and existing.get("cardinalManaged"):
-            settings.pop(_TELEMETRY_KEY)
-
+    # mcpServers: Cardinal's entries, without the marker Gemini rejects.
+    owned_servers: dict = {}
+    servers = settings.get("mcpServers")
+    if isinstance(servers, dict):
+        for name in MANAGED_SERVERS:
+            entry = servers.get(name)
+            if owns_server(name, entry, prior_servers):
+                entry.pop("cardinalManaged", None)
+                owned_servers[name] = server_fingerprint(name, entry)
     if include_hooks:
+        servers = settings.get("mcpServers") if isinstance(settings.get("mcpServers"), dict) else {}
         if mcp_url and mcp_key:
-            servers = settings.get("mcpServers") if isinstance(settings.get("mcpServers"), dict) else {}
-            servers[MCP_SERVER_NAME] = {
-                "url": mcp_url,
-                "headers": {"X-CardinalHQ-API-Key": mcp_key},
-                "cardinalManaged": True,
-            }
+            servers[MCP_SERVER_NAME] = {"url": mcp_url, "headers": {"X-CardinalHQ-API-Key": mcp_key}}
+            owned_servers[MCP_SERVER_NAME] = server_fingerprint(MCP_SERVER_NAME, servers[MCP_SERVER_NAME])
             current = servers.get(BEHAVIOR_SERVER_NAME)
-            if not isinstance(current, dict) or current.get("cardinalManaged"):
-                servers[BEHAVIOR_SERVER_NAME] = {**behavior_server(), "cardinalManaged": True}
+            if not isinstance(current, dict) or owns_server(BEHAVIOR_SERVER_NAME, current, prior_servers):
+                servers[BEHAVIOR_SERVER_NAME] = behavior_server()
+                owned_servers[BEHAVIOR_SERVER_NAME] = server_fingerprint(
+                    BEHAVIOR_SERVER_NAME, servers[BEHAVIOR_SERVER_NAME])
+        if servers:
             settings["mcpServers"] = servers
-
         settings["hooks"] = set_cardinal_hook_entries(settings.get("hooks"))
 
-    backup_path = backup(SETTINGS_PATH)
-    atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2) + "\n")
-    return backup_path
+    # telemetry: Cardinal's block only on request; a user's block stays.
+    current = settings.get(_TELEMETRY_KEY)
+    recorded = prior.get("telemetry")
+    candidate = native_telemetry_block(ingest["endpoint"], gemini_cli_version()) if native and ingest else None
+    ours = isinstance(current, dict) and (
+        bool(current.get("cardinalManaged"))
+        or (isinstance(recorded, dict) and current == recorded)
+        or current == candidate
+    )
+    wanted = None
+    if candidate is not None:
+        if env_assigns(strip_env_block(read_env_file()), HEADERS_ENV):
+            notes.append(f"{ENV_PATH} already sets {HEADERS_ENV}; Gemini CLI's own exporter was "
+                         "left off (remove that line and re-run with --native-telemetry).")
+        elif current is not None and not ours:
+            notes.append(f"{SETTINGS_PATH} has a `telemetry` block Cardinal did not write; Gemini CLI's "
+                         "own exporter was left off (remove the block and re-run with --native-telemetry).")
+        else:
+            wanted = candidate
+    if wanted is not None:
+        settings[_TELEMETRY_KEY] = wanted
+    elif ours:
+        settings.pop(_TELEMETRY_KEY)
+    elif is_legacy_telemetry(current):
+        settings[_TELEMETRY_KEY] = sanitized_telemetry(current)
+        notes.append(f"Made the `telemetry` block in {SETTINGS_PATH} valid for Gemini CLI "
+                     "(target \"otlp\" -> \"local\"; otlpHeaders removed).")
+
+    backup_path = None
+    if settings != before:
+        backup_path = write_settings(before, settings)
+        changed.append(str(SETTINGS_PATH))
+
+    header = (ingest or {}).get("api_header") or "x-cardinalhq-api-key"
+    if apply_env_headers(header if wanted else None, (ingest or {}).get("api_key") if wanted else None):
+        changed.append(str(ENV_PATH))
+
+    return {
+        "changed": changed,
+        "backup": backup_path,
+        "settings_owned": {
+            "telemetry": wanted,
+            "mcp_servers": owned_servers,
+            "env": {"path": str(ENV_PATH), "variable": HEADERS_ENV} if wanted else None,
+        },
+        "native_active": wanted is not None,
+        "notes": notes,
+    }
+
+
+def repair_settings(native: bool | None = None) -> tuple[list[str], list[str]]:
+    """Rewrite settings.json / ~/.gemini/.env to the valid shape without new
+    credentials (a re-run while connected, or --repair): the legacy
+    `telemetry` block, `cardinalManaged` keys on server entries, and the
+    native exporter per `native` (None: as recorded at connect). The ingest
+    key comes from cardinal-secrets.json. (paths changed, notes)"""
+    state = read_state()
+    if native is None:
+        native = bool((state.get("native_telemetry") or {}).get("requested"))
+    try:
+        secrets = json.loads(SECRETS_PATH.read_text())
+    except (OSError, ValueError):
+        secrets = {}
+    ingest = None
+    if isinstance(secrets, dict) and state.get("ingest_endpoint") and secrets.get("ingest_api_key"):
+        ingest = {
+            "endpoint": state["ingest_endpoint"],
+            "api_key": secrets["ingest_api_key"],
+            "api_header": secrets.get("ingest_api_header") or "x-cardinalhq-api-key",
+        }
+    result = apply_settings(ingest, None, None, include_hooks=False, native=native)
+    changed = list(result["changed"])
+    changed += redact_legacy_backups()
+    if STATE_PATH.exists():
+        record = dict(settings_owned_record(state))
+        new_record = {**record, **result["settings_owned"]}
+        new_native = {"requested": bool(native), "enabled": result["native_active"]}
+        if new_record != record or state.get("native_telemetry") != new_native:
+            state["settings_owned"] = new_record
+            state["native_telemetry"] = new_native
+            atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+    elif result["settings_owned"]["mcp_servers"]:
+        result["notes"].append("No ~/.gemini/cardinal.json: cardinal-disconnect --force will not "
+                               "recognise the Cardinal MCP entries left in settings.json.")
+    return changed, result["notes"]
 
 
 def write_secrets(bundle: dict) -> None:
@@ -538,7 +876,8 @@ def write_secrets(bundle: dict) -> None:
 
 
 def write_state(bundle: dict, host: str, deployment_env: str,
-                telemetry_only: bool, no_extension: bool) -> None:
+                telemetry_only: bool, no_extension: bool,
+                settings_result: dict | None = None, native: bool = False) -> None:
     org = bundle.get("org", {})
     user = bundle.get("user", {})
     mcp = bundle.get("mcp") or {}
@@ -563,6 +902,16 @@ def write_state(bundle: dict, host: str, deployment_env: str,
         "extension_dir": str(EXTENSION_INSTALL_DIR) if not no_extension else None,
         "secrets_path": str(SECRETS_PATH),
         "telemetry": {"enabled": bool(ingest)},
+        # Gemini CLI's own OTLP exporter (--native-telemetry): requested,
+        # and whether its settings.json block + .env header were written.
+        "native_telemetry": {
+            "requested": bool(native),
+            "enabled": bool((settings_result or {}).get("native_active")),
+        },
+        # What Cardinal wrote into settings.json / ~/.gemini/.env (Gemini
+        # rejects marker keys there), so cardinal-disconnect removes exactly that.
+        "settings_owned": (settings_result or {}).get("settings_owned")
+        or {"telemetry": None, "mcp_servers": {}, "env": None},
     }
     reason = deviceflow.ingest_unavailable_reason(bundle)
     if reason:
@@ -655,6 +1004,10 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         sys.exit("Cardinal did not return an MCP credential. Check the requested scopes.")
 
     deployment_env = args.deployment_env or deviceflow.derive_deployment_env(args.host)
+    # --native-telemetry / --no-native-telemetry; neither keeps the prior choice.
+    native = getattr(args, "native_telemetry", None)
+    if native is None:
+        native = bool((read_state().get("native_telemetry") or {}).get("requested"))
 
     if args.dry_run:
         print(json.dumps({
@@ -669,7 +1022,8 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                 "ingest_endpoint": (ingest or {}).get("endpoint"),
                 "ingest_unavailable_reason": ingest_reason,
                 "mcp_url": (mcp or {}).get("url"),
-                    "act_scopes": deviceflow.act_granted_scopes(act) if act else None,
+                "native_telemetry": native,
+                "act_scopes": deviceflow.act_granted_scopes(act) if act else None,
             },
         }, indent=2))
         return 0
@@ -698,24 +1052,34 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         install_extension_bundle(mcp_url, mcp_key)
         print(f"Installed Cardinal extension to {EXTENSION_INSTALL_DIR}")
 
-    settings_backup = apply_settings(
-        ingest, mcp_url, mcp_key, include_hooks=args.no_extension
+    settings_result = apply_settings(
+        ingest, mcp_url, mcp_key, include_hooks=args.no_extension, native=native
     )
-    print(f"Wrote Cardinal {'telemetry ' if ingest else ''}config to {SETTINGS_PATH}")
-    if settings_backup:
-        print(f"Settings backup: {settings_backup}")
+    for path in settings_result["changed"]:
+        print(f"Wrote Cardinal config to {path}")
+    if settings_result["backup"]:
+        print(f"Settings backup: {settings_result['backup']}")
+    for note in settings_result["notes"]:
+        print(f"WARN {note}")
 
     revoke_dropped_act_token(args.host, act)
     write_secrets(bundle)
     print(f"Wrote Cardinal local secrets to {SECRETS_PATH}")
 
-    write_state(bundle, args.host, deployment_env, args.telemetry_only, args.no_extension)
+    write_state(bundle, args.host, deployment_env, args.telemetry_only, args.no_extension,
+                settings_result, native)
     print(f"Wrote Cardinal state to {STATE_PATH}")
 
     print()
     print(f"Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
     if ingest:
         print(f"Telemetry endpoint: {ingest['endpoint']}")
+        if settings_result["native_active"]:
+            print(f"Gemini CLI's own OTLP exporter: on (API key header in {ENV_PATH}; "
+                  "a project .env or an untrusted folder hides it, see README)")
+        else:
+            print("Gemini CLI's own OTLP exporter: off (Cardinal's hooks send Cardinal's events; "
+                  "--native-telemetry turns it on)")
     else:
         print(f"WARN {deviceflow.ingest_unavailable_note(ingest_reason or 'unknown', mcp_connected=bool(mcp))}")
         print("     Re-run cardinal-connect --rotate once telemetry ingest is available.")
@@ -756,6 +1120,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="Run the device-code flow and print what would be written.")
     parser.add_argument(
+        "--native-telemetry", action=argparse.BooleanOptionalAction, default=None,
+        help="Also turn on Gemini CLI's own OTLP exporter: a `telemetry` block in "
+             "~/.gemini/settings.json and the ingest key header in ~/.gemini/.env "
+             "(Gemini reads OTLP headers only from the environment). Gemini loads one .env "
+             "per start, so a project .env or an untrusted folder hides the header there. "
+             "Off by default; omitted keeps the prior choice.")
+    parser.add_argument(
+        "--repair", action="store_true",
+        help="Rewrite Cardinal's settings.json / extension entries to what this plugin "
+             "writes, without the device flow or new keys. Fixes the invalid `telemetry` "
+             "block plugin 0.22.1 and earlier wrote (Gemini CLI then refuses to start).")
+    parser.add_argument(
         "scopes", nargs="*", metavar="SCOPE",
         help="Extra scopes for the control-plane token: "
              f"{', '.join(deviceflow.ACT_EXTRA_SCOPES)} (space- or comma-separated). "
@@ -778,8 +1154,29 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def print_repairs(repaired: list[str], notes: list[str]) -> None:
+    for note in notes:
+        print(f"WARN {note}")
+    if repaired:
+        print("Repaired the Cardinal configuration (credentials unchanged):")
+        for path in dict.fromkeys(repaired):
+            print(f"  {path}")
+
+
 def main() -> int:
     args = parse_args()
+
+    if args.repair:
+        # Works without a connection too: a settings.json left broken by an
+        # earlier plugin version must not keep Gemini CLI from starting.
+        repaired = repair_hook_registration() if STATE_PATH.exists() else []
+        changed, notes = repair_settings(args.native_telemetry)
+        print_repairs(repaired + changed, notes)
+        if not (repaired or changed):
+            print("Nothing to repair: Cardinal's Gemini CLI configuration is current.")
+        else:
+            print("Restart Gemini CLI so it reloads settings, hooks and skills.")
+        return 0
 
     if STATE_PATH.exists() and not args.rotate:
         try:
@@ -790,11 +1187,11 @@ def main() -> int:
         # Re-running on an existing connection refreshes the hook
         # registration in place (fixes installs from older plugin versions).
         repaired = repair_hook_registration()
-        if repaired:
-            print("Refreshed the Cardinal extension / hook registration (credentials unchanged):")
-            for path in repaired:
-                print(f"  {path}")
-            print(f"Cardinal is already connected as {user}. Restart Gemini CLI so it reloads hooks and skills.")
+        changed, notes = repair_settings(args.native_telemetry)
+        print_repairs(repaired + changed, notes)
+        if repaired or changed:
+            print(f"Cardinal is already connected as {user}. Restart Gemini CLI so it reloads "
+                  "settings, hooks and skills.")
             return 0
         sys.stderr.write(
             f"Cardinal is already connected as {user}. "

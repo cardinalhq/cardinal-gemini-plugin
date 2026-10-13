@@ -7,12 +7,13 @@ import argparse
 import json
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-from cardinal_core.paths import AgentPaths, atomic_write, backup  # noqa: E402
+from cardinal_core.paths import AgentPaths, atomic_write, atomic_write_secret, backup  # noqa: E402
 
 
 GEMINI_DIR = Path.home() / ".gemini"
@@ -21,6 +22,16 @@ SETTINGS_PATH = GEMINI_DIR / "settings.json"
 EXTENSION_DIR = GEMINI_DIR / "extensions" / "cardinal"
 STATE_PATH = PATHS.state_path
 SECRETS_PATH = PATHS.secrets_path
+# Cardinal's block in ~/.gemini/.env (cardinal-connect --native-telemetry):
+# the ingest key header for Gemini CLI's own OTLP exporter.
+ENV_PATH = GEMINI_DIR / ".env"
+HOOK_MARKER = "cardinal-gemini-plugin"
+HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
+ENV_BLOCK_PREFIX = f"# >>> {HOOK_MARKER}"
+ENV_BLOCK_END = f"# <<< {HOOK_MARKER}"
+# TelemetrySettings properties (gemini-cli 0.63.0); Gemini rejects others.
+TELEMETRY_KEYS = ("enabled", "target", "otlpEndpoint", "otlpProtocol", "traces",
+                  "logPrompts", "outfile", "useCollector", "useCliAuth")
 # Plugin-owned runtime state: telemetry progress cursors, the plan stamp,
 # and spend-limits verdict/ack/override files.
 RUNTIME_DIR = PATHS.runtime_dir
@@ -72,21 +83,46 @@ def read_secrets() -> dict:
     return load_json(SECRETS_PATH) if SECRETS_PATH.exists() else {}
 
 
-def strip_managed_settings(settings: dict) -> tuple[dict, bool]:
-    """Remove Cardinal-managed keys from settings.json. Anything the user
-    tagged themselves (no `cardinalManaged: true`) stays put."""
+def _owns_server(name: str, entry: object, owned: dict) -> bool:
+    """Cardinal's entry: recorded in cardinal.json `settings_owned` (its url,
+    or command + args), or tagged `cardinalManaged` by plugin <= 0.22.1."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("cardinalManaged"):
+        return True
+    fingerprint = owned.get(name)
+    return isinstance(fingerprint, dict) and bool(fingerprint) and all(
+        entry.get(k) == v for k, v in fingerprint.items()
+    )
+
+
+def strip_managed_settings(settings: dict, owned: dict | None = None) -> tuple[dict, bool]:
+    """Remove what Cardinal added to settings.json: what cardinal.json
+    `settings_owned` recorded (`owned`), and the `cardinalManaged`-tagged
+    entries plugin 0.22.1 and earlier wrote. A user's own entries stay; a
+    user's `telemetry` block in the invalid legacy shape (target "otlp",
+    otlpHeaders) is made valid instead, so Gemini CLI starts."""
+    owned = owned if isinstance(owned, dict) else {}
+    owned_servers = owned.get("mcp_servers") if isinstance(owned.get("mcp_servers"), dict) else {}
     changed = False
 
     tel = settings.get("telemetry")
-    if isinstance(tel, dict) and tel.get("cardinalManaged"):
+    recorded = owned.get("telemetry")
+    if isinstance(tel, dict) and (tel.get("cardinalManaged")
+                                  or (isinstance(recorded, dict) and tel == recorded)):
         settings.pop("telemetry", None)
+        changed = True
+    elif isinstance(tel, dict) and ("otlpHeaders" in tel or tel.get("target") == "otlp"):
+        clean = {k: v for k, v in tel.items() if k in TELEMETRY_KEYS}
+        if clean.get("target") not in (None, "local", "gcp"):
+            clean["target"] = "local"
+        settings["telemetry"] = clean
         changed = True
 
     servers = settings.get("mcpServers")
     if isinstance(servers, dict):
         for name in ("cardinal", "cardinal-behavior"):
-            entry = servers.get(name)
-            if isinstance(entry, dict) and entry.get("cardinalManaged"):
+            if _owns_server(name, servers.get(name), owned_servers):
                 servers.pop(name, None)
                 changed = True
         if not servers:
@@ -139,18 +175,73 @@ def strip_managed_settings(settings: dict) -> tuple[dict, bool]:
     return settings, changed
 
 
-def remove_settings_block() -> bool:
+def _redacted_backup() -> Path | None:
+    """Back up settings.json, blanking the ingest key a legacy telemetry
+    block (otlpHeaders) holds."""
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+    except (OSError, ValueError):
+        return backup(SETTINGS_PATH)
+    tel = data.get("telemetry") if isinstance(data, dict) else None
+    if not (isinstance(tel, dict) and isinstance(tel.get("otlpHeaders"), dict)):
+        return backup(SETTINGS_PATH)
+    tel["otlpHeaders"] = {k: "<redacted by cardinal-disconnect>" for k in tel["otlpHeaders"]}
+    target = SETTINGS_PATH.with_name(f"{SETTINGS_PATH.name}.bak.{time.strftime('%Y%m%d-%H%M%S')}")
+    atomic_write_secret(target, json.dumps(data, indent=2) + "\n")
+    return target
+
+
+def remove_settings_block(owned: dict | None = None) -> bool:
     if not SETTINGS_PATH.exists():
         return False
     settings = load_json(SETTINGS_PATH)
-    new_settings, changed = strip_managed_settings(settings)
+    new_settings, changed = strip_managed_settings(settings, owned)
     if changed:
-        backup_path = backup(SETTINGS_PATH)
+        backup_path = _redacted_backup()
         atomic_write(SETTINGS_PATH, json.dumps(new_settings, indent=2) + "\n")
         print(f"Stripped managed Cardinal keys from {SETTINGS_PATH}")
         if backup_path:
             print(f"Backup: {backup_path}")
     return changed
+
+
+def strip_env_block(text: str) -> str:
+    """`text` without Cardinal's ~/.gemini/.env block (same rules as
+    cardinal-connect strip_env_block)."""
+    lines = text.splitlines(keepends=True)
+    if not any(line.startswith(ENV_BLOCK_PREFIX) for line in lines):
+        return text
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        if not inside and line.startswith(ENV_BLOCK_PREFIX):
+            inside = True
+            continue
+        if inside:
+            if line.strip() == ENV_BLOCK_END:
+                inside = False
+                continue
+            if line.startswith(f"{HEADERS_ENV}="):
+                continue
+            inside = False
+        out.append(line)
+    return "".join(out)
+
+
+def remove_env_block() -> bool:
+    try:
+        text = ENV_PATH.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeDecodeError):
+        return False
+    new = strip_env_block(text)
+    if new == text:
+        return False
+    if new.strip():
+        atomic_write_secret(ENV_PATH, new)
+    else:
+        ENV_PATH.unlink()
+    print(f"Removed Cardinal's {HEADERS_ENV} block from {ENV_PATH}")
+    return True
 
 
 def remove_extension_dir() -> bool:
@@ -240,9 +331,10 @@ def main() -> int:
             print(f"Could not revoke control-plane token server-side ({msg}).")
             print(f"Visit {host}/settings/api-keys to revoke it manually.")
 
-    settings_changed = remove_settings_block()
+    settings_changed = remove_settings_block(state.get("settings_owned"))
     if not settings_changed:
         print(f"No managed Cardinal keys found in {SETTINGS_PATH}")
+    remove_env_block()
 
     ext_removed = remove_extension_dir()
     if not ext_removed and not EXTENSION_DIR.exists():
