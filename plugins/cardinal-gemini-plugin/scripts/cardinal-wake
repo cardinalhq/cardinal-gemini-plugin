@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""cardinal-wake — owner-woken sessions (Gemini CLI adapter): notify-only.
+
+Run it in your own terminal (not through the agent):
+    cardinal-wake enable [--launch]   install the per-user launchd agent (macOS)
+    cardinal-wake disable             remove it
+    cardinal-wake status              the setting, disabled runtimes, recent wakes, candidate sessions
+    cardinal-wake run [--once] [--dry-run]
+    cardinal-wake reenable codex      after a failed post-run sandbox check
+
+    cardinal-wake enable --launch --root PATH   approve a directory for Gemini wakes (repeatable)
+
+Gemini CLI sessions are notify-only for now: when you post an owner decision
+on an Investigation page addressed to a stopped Gemini CLI session, the
+waker shows a macOS notification. An unattended Gemini launch (Gemini's
+restrictive-proxied seatbelt sandbox behind an allow-list proxy, in an
+approved root, verified at runtime) is built and ships off until its live
+proofs pass (docs/specs/resume-and-wake.md §5.3 Gemini, §6 C-9..C-14). The
+same waker serves every plugin; Codex CLI sessions that only ever ran
+sandboxed can be resumed (--launch).
+
+The waker reads the investigation events with the Cardinal key of the
+plugin whose session it is (this plugin's: ~/.gemini/cardinal.json mcp_url +
+cardinal-secrets.json mcp_api_key). `enable` copies this plugin's
+cardinal_core and a small runner into ~/.cardinal/wake/lib/ (re-copied by
+every enable), so launchd never points into a versioned plugin directory.
+The implementation is cardinal_core.session_wake.
+"""
+
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+from cardinal_core import session_wake  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(session_wake.cli_main(sys.argv[1:], runtime="gemini", plugin_root=PLUGIN_ROOT))
