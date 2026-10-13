@@ -21,4 +21,6 @@ Besides the ingest and MCP keys, the script requests a control-plane token (`mae
 
 The script prints an approval URL. Show that URL to the user and wait for the script to finish. On success, tell the user to restart Gemini CLI so it reloads `~/.gemini/settings.json` and the extension directory, then suggest `cardinal-status`.
 
-Both Gemini CLI's native OpenTelemetry exporter (pointed at Cardinal ingest) and the plugin's hook-based emitter run in parallel — the hooks fill Cardinal-specific columns (`cardinal.git_state`, `cardinal.turn_tool`, `cardinal.subagent_usage`, spend-limits gate) that the native exporter does not.
+The plugin's hooks send Cardinal's events (`cardinal.git_state`, `cardinal.turn_usage`, `cardinal.turn_tool`, spend-limits gate). Gemini CLI's own OpenTelemetry exporter is off unless the user asks for it: then pass `--native-telemetry`, and tell them its limit — Gemini CLI takes the API key header only from `~/.gemini/.env`, which it does not read in a project with its own `.env` or in an untrusted folder, so its own events are lost there (Cardinal's hooks are unaffected). `--no-native-telemetry` turns it off.
+
+If Gemini CLI refuses to start with `Invalid telemetry target: otlp` (a `settings.json` written by plugin 0.22.1 or earlier), the user must run `python3 "__CARDINAL_PLUGIN_ROOT__/scripts/cardinal-connect" --repair` from a shell — Gemini CLI cannot start to run it.

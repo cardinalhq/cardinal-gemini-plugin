@@ -10,7 +10,7 @@ This is a Gemini-CLI-native port of the command surface shared by the
 
 | Skill / script | What it does |
 | --- | --- |
-| `cardinal-connect` | Runs Cardinal's device-code flow, mints ingest and MCP keys, installs the Cardinal extension bundle under `~/.gemini/extensions/cardinal/`, and wires Gemini CLI's native OTLP exporter to Cardinal ingest. |
+| `cardinal-connect` | Runs Cardinal's device-code flow, mints ingest and MCP keys, and installs the Cardinal extension bundle under `~/.gemini/extensions/cardinal/`. `--native-telemetry` also points Gemini CLI's own OTLP exporter at Cardinal ingest (opt-in, see "Gemini CLI's own exporter"). `--repair` fixes a `settings.json` an earlier plugin version broke. |
 | `cardinal-status` | Shows the recorded Cardinal workspace and probes the configured ingest and MCP endpoints. |
 | `cardinal-disconnect` | Best-effort revokes Cardinal keys, removes the extension bundle and managed settings.json entries, and deletes local state. |
 | `cardinal-decision` | Opt-in decision capture: `on` / `off` / `status`, and `record` (called by the agent) emits one `cardinal.decision` event tagged with repo, branch, head sha, PR, anchors and code clusters. The `cardinal-decision` skill reports status only and gives you the `on` / `off` command to run yourself. |
@@ -19,13 +19,13 @@ This is a Gemini-CLI-native port of the command surface shared by the
 
 ## Telemetry scope
 
-Gemini CLI ships a native OpenTelemetry exporter (`gemini_cli.token.usage`,
+Plugin-owned hooks emit the Cardinal event contract used by the sibling
+plugins (see `docs/specs/adapter-parity.md` at the repository root for the
+parity map). Gemini CLI's own OpenTelemetry exporter (`gemini_cli.token.usage`,
 `gemini_cli.tool.call.*`, `gemini_cli.api.request.*`, `gemini_cli.user_prompt`,
-plus session / config / agent / compression log events). This plugin points
-that exporter directly at Cardinal ingest, so those events arrive without
-any hook code. On top of that, plugin-owned hooks emit the Cardinal-specific
-event contract used by the sibling plugins (see `docs/specs/gemini-parity.md`
-at the repository root for the full parity map):
+plus session / config / agent / compression log events) is **off unless you
+pass `--native-telemetry`**; see "Gemini CLI's own exporter" for why. The hooks
+send:
 
 - `cardinal.git_state` from the active Git checkout on `BeforeAgent`, with initiative classification from the branch name (worktree-noise stripped), slash-command detection, and the branch's PR (`cardinal_pr_number` / `cardinal_pr_url`) when `gh pr view` resolves one (cached per repo+branch; keys absent otherwise).
 - `api_request` + `cardinal.turn_usage` per model call from `AfterModel`. Gemini CLI fires `AfterModel` once per streamed chunk; the hook exits immediately on non-final chunks and accounts the final chunk's `llm_response.usageMetadata` (prompt, candidates, total — thought/tool-use-prompt tokens are derived as the remainder; cached-content tokens are not exposed to hooks, so cost ignores cache discounts). Treat cost as an upper bound: the remainder mixes thought and tool-use-prompt tokens and is priced at the output rate. A stream that errors before its final chunk records no usage for that call.
@@ -44,6 +44,54 @@ before reading it stays under `~/.gemini/cardinal/spool/`.
 Claude subscription-specific plan fields that do not exist in Gemini CLI are
 left empty; Gemini plan/rate-limit fields are mapped onto the existing plan
 usage columns where possible.
+
+### Gemini CLI's own exporter (opt-in)
+
+`cardinal-connect --native-telemetry` writes this `telemetry` block into
+`~/.gemini/settings.json`:
+
+```json
+{"enabled": true, "target": "local", "otlpEndpoint": "<ingest endpoint>",
+ "otlpProtocol": "http", "logPrompts": false}
+```
+
+Gemini CLI then exports in process over OTLP/http to `<endpoint>/v1/logs`,
+`/v1/traces` and `/v1/metrics` (it appends the paths itself from 0.34.0;
+on an older CLI connect writes `<endpoint>/v1/logs`). `target` must be
+`local` or `gcp`: any other value stops Gemini CLI from starting.
+
+Gemini CLI has no settings key for OTLP headers: the exporters read the
+API key header only from the environment variable
+`OTEL_EXPORTER_OTLP_HEADERS`. Connect puts it in a marked block in
+`~/.gemini/.env` (mode 0600), which Gemini CLI loads at start. That works
+only where Gemini CLI actually reads that file:
+
+- Gemini CLI loads **one** `.env` per start: walking up from the working
+  directory, `<dir>/.gemini/.env` then `<dir>/.env`, and only past the
+  filesystem root `~/.gemini/.env`, then `~/.env`. In a project that has its
+  own `.env` (or one in a parent directory), `~/.gemini/.env` is not read,
+  and Gemini's exporter sends without the key there (ingest answers 401).
+- In a folder Gemini CLI does not trust (folder trust is on by default),
+  it skips `~/.gemini/.env`, with the same effect.
+- A variable already set in your shell wins: your own
+  `OTEL_EXPORTER_OTLP_HEADERS`, or `OTEL_EXPORTER_OTLP_ENDPOINT` /
+  `GEMINI_TELEMETRY_OTLP_ENDPOINT` (which override the settings endpoint and
+  would receive Cardinal's header).
+- Gemini CLI passes its environment to the commands and MCP servers it
+  starts, so OpenTelemetry-instrumented programs you run from Gemini CLI
+  inherit the header (and may send it to their own collector).
+
+Where the header is missing only Gemini's own events are lost: Cardinal's
+hooks read the key from `~/.gemini/cardinal-secrets.json` and keep working.
+`cardinal-status` shows whether the exporter is on and warns when the
+current directory hides `~/.gemini/.env`. `--no-native-telemetry` turns it
+off; without either flag, connect keeps the earlier choice.
+
+Nothing Cardinal writes into `settings.json` carries the key or a marker
+key: Gemini CLI rejects unknown keys in `telemetry` and in `mcpServers`
+entries. What Cardinal wrote there is recorded in `~/.gemini/cardinal.json`
+(`settings_owned`), and `cardinal-disconnect` removes exactly that, plus
+the `.env` block.
 
 ### Payload-shape capture
 
@@ -296,8 +344,9 @@ writes:
 | `~/.gemini/extensions/cardinal/skills/` | The plugin's skills (connect, status, disconnect, decision, storyboard, canvas, install-site, migrate-from-grafana, optimize-toolkit), with each script path rewritten to this plugin's absolute path. Gemini CLI loads an extension's `skills/*/SKILL.md`. |
 | `~/.gemini/extensions/cardinal/agents/` | The `brainstorm` subagent (Gemini's local-agent Markdown format, read-only tools). |
 | `~/.gemini/extensions/cardinal/GEMINI.md` | Context file loaded into the model context by Gemini CLI. |
-| `~/.gemini/settings.json` | Managed `telemetry` block pointing Gemini's native OTLP exporter at Cardinal ingest. |
-| `~/.gemini/cardinal.json` | Non-secret state: org/user metadata, endpoint URLs, key ids, key prefixes, and config locations. |
+| `~/.gemini/settings.json` | Nothing by default. With `--native-telemetry`, the `telemetry` block above (no key). With `--no-extension`, the `cardinal` / `cardinal-behavior` MCP servers and the hook groups. |
+| `~/.gemini/.env` | Only with `--native-telemetry`: a marked block setting `OTEL_EXPORTER_OTLP_HEADERS` to the ingest key header (file mode 0600). Your own lines are kept. |
+| `~/.gemini/cardinal.json` | Non-secret state: org/user metadata, endpoint URLs, key ids, key prefixes, config locations, and what Cardinal wrote into `settings.json` / `.env` (`settings_owned`). |
 | `~/.gemini/cardinal-secrets.json` | Local plaintext ingest/MCP keys needed by hooks and status probes; written mode `0600`. |
 
 Restart Gemini CLI after connecting so it reloads MCP, hook config, and
@@ -312,6 +361,8 @@ python3 scripts/cardinal-connect --rotate
 python3 scripts/cardinal-connect --telemetry-only
 python3 scripts/cardinal-connect --no-extension
 python3 scripts/cardinal-connect --dry-run
+python3 scripts/cardinal-connect --native-telemetry     # also Gemini CLI's own exporter
+python3 scripts/cardinal-connect --repair               # fix settings.json, no new keys
 python3 scripts/cardinal-status
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
@@ -329,6 +380,40 @@ python3 scripts/cardinal-checks on|off|status
   `cardinal-status` warns when hooks are disabled or the CLI is too old.
 - Python 3.11+.
 - A Cardinal account.
+
+### Gemini CLI refuses to start after `cardinal-connect` (plugin 0.22.1 and earlier)
+
+Plugin versions up to 0.22.1 wrote a `telemetry` block Gemini CLI rejects,
+so it exits at once with:
+
+```
+Invalid configuration in ~/.gemini/settings.json:
+Error in: telemetry
+    Unrecognized key(s) in object: 'otlpHeaders', 'cardinalManaged'
+Invalid telemetry configuration: Invalid telemetry target: otlp. Valid values are: local, gcp.
+```
+
+That block (`target: "otlp"`) was invalid on every Gemini CLI from 0.26.0
+on, and it held the ingest key in plain text. A Cardinal hook cannot fix it
+because Gemini CLI stops before any hook runs. Update the plugin, then run
+from a shell:
+
+```bash
+python3 <plugin>/scripts/cardinal-connect --repair
+```
+
+(`<plugin>` is this plugin's directory; the path is in
+`~/.gemini/extensions/cardinal/hooks/hooks.json`. Re-running
+`cardinal-connect` with no flags does the same when Cardinal is connected.)
+The repair removes Cardinal's block, or rewrites it to the valid shape
+with `--native-telemetry`; removes `cardinalManaged` from Cardinal's
+`mcpServers` entries; blanks the key in `settings.json.bak.*` backups
+earlier connects wrote; and changes no credentials. A `telemetry` block
+that isn't Cardinal's but uses `target: "otlp"` or `otlpHeaders` is made
+valid (`target` set to `local`, `otlpHeaders` dropped) rather than removed.
+`cardinal-status` reports the broken block. Without the plugin at hand,
+delete the `"telemetry": {...}` entry from `~/.gemini/settings.json` by
+hand.
 
 ### Upgrading from plugin versions before 0.17
 
