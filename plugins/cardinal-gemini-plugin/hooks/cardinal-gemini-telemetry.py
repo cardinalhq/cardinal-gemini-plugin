@@ -1365,7 +1365,8 @@ def shell_failure(payload: dict[str, Any], session_id: str | None) -> str | None
 
 def authoring_lines(payload: dict[str, Any], session_id: str | None) -> list[str]:
     """Storyboard authoring around Cardinal's tools: the evidence token
-    (storyboard__create / add_act / preview), the hero upload after
+    (storyboard__create / add_act / preview), the evidence hold after a
+    successful storyboard__checkpoint, the hero upload after
     storyboard__publish (network, UPLOAD_TIMEOUT_S), and the storyboards
     about a file write_file / replace just edited (edit lookup, network,
     ending by START + EDIT_BUDGET_S). Never raises."""
