@@ -1,0 +1,30 @@
+# Read-only policy for the supervise skill's headless step-back pass:
+#   gemini -e none --policy <this file> ... -p
+# A --policy file loads in the user tier, above every bundled default
+# (YOLO's allow-all included), in every approval mode. A tool denied here
+# is not offered to the model at all (verified on gemini-cli 0.64.0).
+
+# No mode changes: headless, exit_plan_mode switches to YOLO.
+[[rule]]
+toolName = ["enter_plan_mode", "exit_plan_mode"]
+decision = "deny"
+priority = 990
+
+# No MCP tools.
+[[rule]]
+toolName = "*"
+mcpName = "*"
+decision = "deny"
+priority = 990
+
+# Nothing else (writes, shell, web, skills, subagents) ...
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 900
+
+# ... except reading and searching files.
+[[rule]]
+toolName = ["read_file", "read_many_files", "glob", "grep_search", "list_directory"]
+decision = "allow"
+priority = 950
