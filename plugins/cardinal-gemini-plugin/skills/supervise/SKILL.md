@@ -40,6 +40,20 @@ When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's 
 shows them the outcome and gives you the same line. Confirm it in one line; run nothing to
 send or approve it. No Cardinal line means nothing was sent; say so.
 
+## Fresh-context passes (step backs)
+
+Run each pass (CORE.md, Step backs) as a separate headless Gemini, the copy `budget pass` wrote
+on stdin:
+
+```
+gemini -e none --policy <this-skill-directory>/stepback-policy.toml --include-directories <code checkout> --skip-trust --approval-mode default -p "Answer the question at the end of the brief above." < <the copy>
+```
+
+Keep every flag: the policy leaves it only file reads and searches (otherwise headless Gemini
+can write), and `-e none` drops Cardinal's tools and hooks.
+If one fails, tell the owner the step back needs a Claude supervisor; for a plan, answer the
+estimator copy yourself.
+
 ## Doing your own checks
 
 Reproduce claims read-only: `read_file`, `git log` / `git diff`, Cardinal query tools
