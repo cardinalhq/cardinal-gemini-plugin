@@ -29,7 +29,11 @@ Event dispatch (payload shapes: packages/core/src/hooks/types.ts):
   BeforeAgent   → spend-limits gate + decision prompt + what was staged
                   for this prompt (additionalContext); owner input
                   (owner_input.capture, detached: no network here) with its
-                  one-time disclosure as systemMessage; background:
+                  one-time disclosure as systemMessage; the owner's
+                  `decide: …` / `approve|reject dp_…` (relayed owner
+                  decisions, owner_relay: the one synchronous request, bounded ~3 s,
+                  only for such a prompt; outcome as systemMessage and
+                  context); background:
                   cardinal.git_state (+PR) + verdict refresh + the discovery
                   re-look (staged for the next boundary)
   AfterModel    → api_request + cardinal.turn_usage, final chunk only
@@ -562,6 +566,36 @@ def capture_owner_input(payload: dict[str, Any], session_id: str, cwd: str) -> s
         owner_input_log(status)
 
 
+def relay_owner_decision(payload: dict[str, Any], session_id: str) -> tuple[str | None, str | None]:
+    """Relayed owner decisions (owner_relay.handle_prompt, runtime "gemini"):
+    when what the owner typed (hook_context and @file sections removed;
+    never a machine prompt or a subagent's) is exactly `decide: <text>`
+    (their own words, to the registered worker), `approve dp_…` (bare
+    `approve` for the only pending proposal) or `reject dp_…`, relay the
+    decision to the worker with this machine's key, or drop it. The one synchronous network
+    call of BeforeAgent, made only for such a prompt and bounded by START +
+    owner_relay.BUDGET. A re-fired BeforeAgent for the same prompt repeats
+    the outcome without relaying again. Returns (the outcome shown to the
+    user, the terser one given to the model), or (None, None). Runs whether
+    or not owner input is on. Never raises."""
+    try:
+        from cardinal_core import investigation_events as ie
+
+        if not ie.valid_session(session_id):
+            return None, None
+        from cardinal_core import owner_relay
+
+        wiring = storyboard_wiring()
+        agent_id = payload.get("agent_id")
+        got = owner_relay.handle_prompt(Path.home(), session_id, payload.get("prompt"), runtime="gemini",
+                                        conn=wiring.connection(), client=wiring.client,
+                                        agent_id=agent_id if isinstance(agent_id, str) else None,
+                                        deadline=START + owner_relay.BUDGET)
+        return got.message, got.model_text()
+    except Exception:
+        return None, None
+
+
 def mark_disclosure_shown(session_id: str) -> None:
     """The owner-input disclosure was flushed to Gemini as a systemMessage:
     record it (owner_input.mark_disclosed), so capture starts with the next
@@ -612,14 +646,21 @@ def handle_before_agent(payload: dict[str, Any]) -> None:
     except Exception:
         pass
     disclosure = None
+    relayed = None
     if not blocked:
         # A blocked prompt never reaches the model, and a block cannot show
-        # the disclosure: nothing is captured or delivered for it.
+        # the disclosure: nothing is captured or delivered for it. The
+        # owner's approval of a proposed owner decision comes first and is
+        # independent of owner-input capture.
+        relayed, told = relay_owner_decision(payload, session_id)
+        if told:
+            parts.append(told)
         disclosure = capture_owner_input(payload, session_id, cwd)
         staged = staged_for_prompt(session_id)
         if staged:
             parts.append(staged)
-    prompt_out = merge_prompt_output(gate_out, "\n\n".join(parts) or None, disclosure)
+    prompt_out = merge_prompt_output(gate_out, "\n\n".join(parts) or None,
+                                     "\n".join(x for x in (relayed, disclosure) if x) or None)
     if prompt_out:
         sys.stdout.write(json.dumps(prompt_out))
         sys.stdout.flush()
