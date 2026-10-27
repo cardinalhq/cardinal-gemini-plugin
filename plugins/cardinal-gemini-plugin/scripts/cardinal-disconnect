@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 from cardinal_core.paths import AgentPaths, atomic_write, atomic_write_secret, backup  # noqa: E402
+from cardinal_core import tls as _tls  # noqa: E402,F401  (a pinned self-signed host)
 
 
 GEMINI_DIR = Path.home() / ".gemini"
