@@ -357,6 +357,8 @@ extensions.
 ```bash
 python3 scripts/cardinal-connect
 python3 scripts/cardinal-connect --host https://app.cardinalhq.io
+# a self-hosted Cardinal behind a self-signed certificate: connect shows the
+# certificate and asks; --trust-cert <sha256> pins it (docs/specs/tls-trust.md)
 python3 scripts/cardinal-connect --rotate
 python3 scripts/cardinal-connect --telemetry-only
 python3 scripts/cardinal-connect --no-extension
